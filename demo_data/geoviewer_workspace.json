@@ -1,0 +1,321 @@
+{
+  "format": "GeoViewer workspace",
+  "version": 1,
+  "app_version": "0.1.0",
+  "saved": "2026-11-23T16:18:16",
+  "view": {
+    "mode": "3d",
+    "grid": true,
+    "focal_point": [
+      1640.386588955185,
+      7201.267349489378,
+      -150.378004678561
+    ],
+    "position": [
+      1684.0169025044647,
+      7524.140575624526,
+      806.6321982098932
+    ],
+    "view_up": [
+      0.11571367368095943,
+      -0.9427486801686081,
+      0.3127863036700996
+    ],
+    "parallel_scale": 316.6001668878537,
+    "perspective": true
+  },
+  "layers": [
+    {
+      "name": "layout2",
+      "type": "SurfaceLayer",
+      "part": "",
+      "files": [
+        "layout2.dtm"
+      ],
+      "settings": {
+        "visible": false,
+        "opacity": 1.0,
+        "color": [
+          0.6313725709915161,
+          0.2235294133424759,
+          0.2235294133424759
+        ],
+        "use_styles": false,
+        "smooth": false,
+        "show_edges": false
+      }
+    },
+    {
+      "name": "pit1",
+      "type": "SurfaceLayer",
+      "part": "",
+      "files": [
+        "pit1.dtm"
+      ],
+      "settings": {
+        "visible": false,
+        "opacity": 1.0,
+        "color": [
+          0.98,
+          0.85,
+          0.3
+        ],
+        "use_styles": true,
+        "smooth": false,
+        "show_edges": false
+      }
+    },
+    {
+      "name": "ug111",
+      "type": "SurfaceLayer",
+      "part": "",
+      "files": [
+        "ug1.dtm"
+      ],
+      "settings": {
+        "visible": true,
+        "opacity": 1.0,
+        "color": [
+          0.85,
+          0.55,
+          0.4
+        ],
+        "use_styles": true,
+        "smooth": false,
+        "show_edges": false
+      }
+    },
+    {
+      "name": "fault1",
+      "type": "SurfaceLayer",
+      "part": "",
+      "files": [
+        "fault1.dtm"
+      ],
+      "settings": {
+        "visible": false,
+        "opacity": 1.0,
+        "color": [
+          0.3,
+          0.69,
+          0.95
+        ],
+        "use_styles": true,
+        "smooth": false,
+        "show_edges": false
+      }
+    },
+    {
+      "name": "topo1",
+      "type": "SurfaceLayer",
+      "part": "",
+      "files": [
+        "topo1.dtm"
+      ],
+      "settings": {
+        "visible": false,
+        "opacity": 1.0,
+        "color": [
+          0.65,
+          0.65,
+          0.65
+        ],
+        "use_styles": true,
+        "smooth": false,
+        "show_edges": false
+      }
+    },
+    {
+      "name": "ore1",
+      "type": "SurfaceLayer",
+      "part": "",
+      "files": [
+        "ore1.dtm"
+      ],
+      "settings": {
+        "visible": false,
+        "opacity": 1.0,
+        "color": [
+          0.75,
+          0.52,
+          0.95
+        ],
+        "use_styles": true,
+        "smooth": false,
+        "show_edges": false
+      }
+    },
+    {
+      "name": "block_model",
+      "type": "BlockModelLayer",
+      "part": "",
+      "files": [
+        "block_model.csv"
+      ],
+      "settings": {
+        "visible": true,
+        "opacity": 1.0,
+        "color": [
+          0.96,
+          0.62,
+          0.2
+        ],
+        "color_by": "gold",
+        "cmap": "jet",
+        "hide_null": true,
+        "value_min": null,
+        "value_max": null,
+        "clim": null,
+        "show_edges": false,
+        "constraints": [
+          {
+            "kind": "dtm",
+            "layer": "ore1",
+            "mode": "inside"
+          }
+        ],
+        "constraint_logic": "and",
+        "mined_display": "gray"
+      }
+    },
+    {
+      "name": "Drillholes (database)",
+      "type": "DrillholeLayer",
+      "part": "",
+      "files": [],
+      "settings": {
+        "visible": true,
+        "opacity": 1.0,
+        "color": [
+          0.65,
+          0.65,
+          0.65
+        ],
+        "table": "geology",
+        "field_name": "rock",
+        "cmap": "turbo",
+        "diameter": 1.5,
+        "show_labels": false,
+        "category_colors": {
+          "S2": [
+            0.6352941176470588,
+            0.596078431372549,
+            0.17647058823529413
+          ],
+          "SH": [
+            0.35294117647058826,
+            0.27450980392156865,
+            0.09411764705882353
+          ],
+          "ST": [
+            0.2784313725490196,
+            0.5450980392156862,
+            0.27450980392156865
+          ],
+          "QV1": [
+            0.9490196078431372,
+            0.5215686274509804,
+            0.0
+          ],
+          "MU": [
+            0.25098039215686274,
+            0.3607843137254902,
+            0.6549019607843137
+          ],
+          "IN": [
+            0.5490196078431373,
+            0.1803921568627451,
+            0.15294117647058825
+          ],
+          "B": [
+            0.43137254901960786,
+            0.2,
+            0.5450980392156862
+          ]
+        }
+      },
+      "source": "database"
+    },
+    {
+      "name": "Pits",
+      "type": "SurveyLayer",
+      "part": "",
+      "files": [],
+      "settings": {
+        "visible": true,
+        "opacity": 1.0,
+        "color": [
+          0.65,
+          0.65,
+          0.65
+        ],
+        "show_drives": true,
+        "show_labels": false,
+        "pit_styles": {
+          "4": {
+            "visible": true
+          },
+          "5": {
+            "visible": true
+          },
+          "3": {
+            "visible": true,
+            "color": null
+          },
+          "2": {
+            "visible": true
+          },
+          "11": {
+            "visible": true
+          },
+          "1": {
+            "centerline": false,
+            "stations": false,
+            "visible": true
+          },
+          "8": {
+            "color": null
+          }
+        }
+      },
+      "source": "database"
+    }
+  ],
+  "app_layers": {
+    "Mined shapes": {
+      "name": "Mined shapes",
+      "settings": {
+        "visible": false,
+        "opacity": 0.45,
+        "color": [
+          1.0,
+          0.6,
+          0.2
+        ]
+      }
+    }
+  },
+  "known_files": [
+    "all_pits.dtm",
+    "all_pits.str",
+    "block_model.csv",
+    "fault1.dtm",
+    "fault1.str",
+    "geoviewer.sqlite",
+    "layout1.str",
+    "layout2.dtm",
+    "layout2.str",
+    "ore1.dtm",
+    "ore1.str",
+    "pit1.dtm",
+    "pit1.str",
+    "rings12.str",
+    "surpac.accdb",
+    "surpac.ddb",
+    "topo1.dtm",
+    "topo1.str",
+    "topo2.dxf",
+    "ug1.dtm",
+    "ug1.str"
+  ]
+}

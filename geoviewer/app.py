@@ -1,0 +1,260 @@
+"""Application entry point: ``python -m geoviewer [-w FOLDER] [files...]``.
+
+Options:
+  -w, --workspace FOLDER   open this workspace folder (instead of the last one).
+  --smoke-test             open the window, load the given workspace / files, then quit by
+                           itself. Exit code 0 = loaded without errors, 2 = load errors,
+                           3 = timeout. Used by the release build to check the packaged .exe.
+
+Without -w or files, the last workspace is opened again (unless switched off in Settings).
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import traceback
+
+log = logging.getLogger(__name__)
+from pathlib import Path
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(prog="GeoViewer", add_help=False)
+    ap.add_argument("-w", "--workspace", default=None)
+    ap.add_argument("--smoke-test", action="store_true")
+    ap.add_argument("files", nargs="*")
+    args, _unknown = ap.parse_known_args(argv)  # ignore Qt's own options (-style, ...)
+    return args
+
+
+def log_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "GeoViewer" / "logs"
+
+
+def _setup_logging(smoke: bool) -> Path:
+    """Send stdout/stderr to a log file when there is no console (windowed .exe),
+    and log unhandled exceptions instead of letting them vanish or abort the app."""
+    path = log_dir() / "geoviewer.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 2_000_000:
+            path.replace(path.with_suffix(".old.log"))
+        if sys.stderr is None or sys.stdout is None:
+            f = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 - lives for the process
+            if sys.stdout is None:
+                sys.stdout = f
+            if sys.stderr is None:
+                sys.stderr = f
+    except OSError:
+        pass
+
+    def excepthook(etype, value, tb):
+        text = "".join(traceback.format_exception(etype, value, tb))
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n--- unhandled exception ---\n" + text)
+        except OSError:
+            pass
+        if sys.stderr is not None:
+            sys.stderr.write(text)
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        app = QApplication.instance()
+        if smoke:
+            if app is not None:
+                app.exit(4)
+            return
+        if app is not None:
+            from .i18n import tr
+
+            QMessageBox.critical(None, tr("GeoViewer - unexpected error"),
+                                 tr("{error}\n\nDetails were written to:\n{path}", error=value, path=path))
+
+    sys.excepthook = excepthook
+    return path
+
+
+def _arm_smoke_test(app, win, timeout_ms: int = 60000) -> None:
+    import time
+
+    from PySide6.QtCore import QTimer
+
+    start = time.monotonic()
+    state = {"done_at": None}
+
+    def poll():
+        busy = bool(win._threads) or win.loads_pending > 0
+        if not busy and state["done_at"] is None:
+            state["done_at"] = time.monotonic()
+        if state["done_at"] is not None and time.monotonic() - state["done_at"] > 1.0:
+            app.exit(2 if win.load_errors else 0)
+        elif (time.monotonic() - start) * 1000 > timeout_ms:
+            app.exit(3)
+
+    timer = QTimer(app)
+    timer.timeout.connect(poll)
+    timer.start(250)
+    app._smoke_timer = timer  # keep a reference
+
+
+class FreezeWatchdog:
+    """Writes the stack of every thread to the log when the GUI stops responding.
+
+    A timer in the GUI thread ticks every second; a background thread checks the last
+    tick and, after ``limit`` seconds without one, dumps all stacks once (until the GUI
+    responds again). Costs nothing while the app runs normally."""
+
+    def __init__(self, app, log_path: Path, limit: float = 15.0):
+        import threading
+        import time
+
+        from PySide6.QtCore import QTimer
+
+        self.log_path = log_path
+        self.limit = limit
+        self._time = time
+        self._last = time.monotonic()
+        self._dumped = False
+        self._timer = QTimer(app)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, name="freeze-watchdog", daemon=True)
+        self._thread.start()
+
+    def _tick(self) -> None:
+        if self._dumped:
+            self._append(f"--- GUI responsive again after "
+                         f"{self._time.monotonic() - self._last:.0f} s ---\n")
+        self._last = self._time.monotonic()
+        self._dumped = False
+
+    def _append(self, text: str) -> None:
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+    def _watch(self) -> None:
+        import faulthandler
+
+        while not self._stop.wait(2.0):
+            stalled = self._time.monotonic() - self._last
+            if stalled > self.limit and not self._dumped:
+                self._dumped = True
+                try:
+                    with open(self.log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n--- GUI not responding for {stalled:.0f} s "
+                                f"({self._time.strftime('%Y-%m-%d %H:%M:%S')}); stacks: ---\n")
+                        f.flush()
+                        faulthandler.dump_traceback(file=f, all_threads=True)
+                except OSError:
+                    pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._timer.stop()
+
+
+def saved_language() -> str:
+    """The language chosen in Settings ("" = follow Windows)."""
+    from PySide6.QtCore import QSettings
+
+    from .i18n import LANGUAGE_KEY
+
+    return str(QSettings("GeoViewer", "GeoViewer").value(LANGUAGE_KEY, "") or "")
+
+
+def apply_language(app, code: str | None = None):
+    """Use the chosen language (else the Windows display language, else English) for
+    GeoViewer's texts, and Qt's own translation of its standard buttons and dialogs."""
+    from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
+
+    from . import i18n
+
+    lang = i18n.set_language(code or saved_language() or QLocale.system().name())
+    old = getattr(app, "_qt_translator", None)
+    if old is not None:
+        app.removeTranslator(old)
+        app._qt_translator = None
+    if lang.code != i18n.DEFAULT and lang.qt:
+        import PySide6
+
+        qt = QTranslator(app)
+        for folder in (QLibraryInfo.path(QLibraryInfo.TranslationsPath),
+                       str(Path(PySide6.__file__).resolve().parent / "translations")):
+            if qt.load(f"qtbase_{lang.qt}", folder):
+                app.installTranslator(qt)
+                app._qt_translator = qt
+                break
+    log.info("language: %s", lang.code)
+    return lang
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    args = parse_args(argv[1:])
+    smoke = args.smoke_test
+    log_path = _setup_logging(smoke)
+    from PySide6.QtWidgets import QApplication
+
+    if os.name == "nt":
+        # its own taskbar button and icon on Windows (run from source, the taskbar would group
+        # the window under python.exe and show Python's icon)
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GeoViewer.GeoViewer")
+        except Exception:  # noqa: BLE001 - only the taskbar grouping
+            pass
+    app = QApplication.instance() or QApplication(argv)
+    app.setApplicationName("GeoViewer")
+    app.setOrganizationName("GeoViewer")
+    apply_language(app)                       # before any window is made: texts are read once
+    from .ui.icons import app_icon
+
+    app.setWindowIcon(app_icon())             # every window, the taskbar and Alt+Tab
+    watchdog = FreezeWatchdog(app, log_path)  # noqa: F841 - lives as long as the app
+
+    from .ui.main_window import MainWindow
+    from .ui.theme import apply_dark_theme
+
+    apply_dark_theme(app)
+
+    if not smoke:                   # the app needs a valid license (the smoke test is exempt)
+        from . import licensing
+        from .ui.license_dialog import ensure_licensed
+
+        if not licensing.current().ok and not ensure_licensed(None):
+            log.warning("no valid license: %s", licensing.current().reason)
+            return 3
+
+    win = MainWindow()
+    win.quiet_errors = smoke
+    if smoke:                       # test the bundled SQLite, not a MySQL server the settings may name
+        from .io import database
+
+        database.configure(database.DatabaseConfig(backend="sqlite"))
+    win.showMaximized()
+    if args.workspace:
+        win.open_workspace(args.workspace, confirm=False)
+    elif not args.files and not smoke:
+        win.restore_last_workspace()
+    if args.files:
+        win.open_paths(args.files)
+    if smoke:
+        _arm_smoke_test(app, win)
+    code = app.exec()
+    watchdog.stop()
+    if smoke and win.load_errors and sys.stderr is not None:
+        sys.stderr.write("\n".join(win.load_errors) + "\n")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
