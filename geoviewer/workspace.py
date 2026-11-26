@@ -10,6 +10,8 @@ Refresh support: every layer remembers the signature (modification time and
 size) of each file it depends on. ``changed_layers`` finds layers whose files
 changed, ``reload_layers`` loads them again with their display settings, and
 ``Workspace.find_new_files`` reports data files that appeared in the folder.
+Block model CSVs are never loaded as layers: they are collected in ``Workspace.block_csvs``
+for the app to import into GeoViewer block models (.gvbm).
 All functions here are free of Qt and can run in a worker thread.
 """
 
@@ -145,6 +147,24 @@ def loadable_groups(candidates: list[Path], all_files: list[Path]) -> list[list[
         if keep:
             out.append(keep)
     return out
+
+
+def is_block_csv(p: Path) -> bool:
+    """A block model CSV export. GeoViewer never shows one as it is: it is imported into a
+    GeoViewer block model (.gvbm) in the Block Model Manager first."""
+    return p.suffix.lower() == ".csv" and csv_role(p) == "blocks"
+
+
+def split_block_csvs(paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    """(other files, block model CSVs to import). A block model CSV with a .gvbm of the same
+    name next to it was imported already: the .gvbm shows it, the CSV is left out."""
+    others, blocks = [], []
+    for p in paths:
+        if not is_block_csv(p):
+            others.append(p)
+        elif not p.with_suffix(".gvbm").exists():
+            blocks.append(p)
+    return others, blocks
 
 
 # --- layer specs (what a workspace stores per layer) ----------------------------------
@@ -301,6 +321,10 @@ class Workspace:
         self.app_layers: dict = {}              # kind -> {"name", "settings"} of layers the app makes
         self.database_notes: list[str] = []     # what the last init made, e.g. ["made table drillhole_assay"]
         self.database_error = ""                 # why the project database cannot be used ("" = connected)
+        self.database_ready = False              # init_database ran (a folder adopted for opened files: not yet)
+        # block model CSVs found (folder scan, Refresh, a CSV layer of an older workspace file):
+        # shown only once imported as .gvbm; the app takes this list and offers the import
+        self.block_csvs: list[Path] = []
 
     @property
     def file(self) -> Path:
@@ -348,6 +372,10 @@ class Workspace:
                     log.info("workspace: extra copy of %s (%s) not opened", spec.get("name"), spec.get("type"))
                     continue
                 seen.add(key)
+                csv = self._block_csv_of(spec)
+                if csv is not None:                # a CSV block model layer (earlier versions)
+                    self.block_csvs.append(csv)
+                    continue
                 if spec.get("source") == "database" and self.database_error:
                     layer, errs = offline_database_layer(project_target(self.folder), self.database_error,
                                                          spec), []
@@ -364,12 +392,15 @@ class Workspace:
             self.known = {_key(_from_text(f, self.folder)) for f in data.get("known_files", [])}
             for layer in layers:
                 self.known |= {_key(p) for p in layer.inputs}
+            self.known |= {_key(p) for p in self.block_csvs}
             # Files that appeared while the app was closed are loaded as new layers.
             new = [p for p in all_files if _key(p) not in self.known and not app_made(p)]
         else:
             new = all_files
         new_ready = [p for p in new if not _recent(p, time.time())]
-        for group in loadable_groups(new_ready, all_files):
+        loadable, blocks = split_block_csvs(new_ready)
+        self.block_csvs += blocks
+        for group in loadable_groups(loadable, all_files):
             lays, errs = load_paths(group)
             layers += lays
             errors += errs
@@ -383,6 +414,15 @@ class Workspace:
         errors += errs
         return layers, errors, view
 
+    def _block_csv_of(self, spec: dict) -> Path | None:
+        """The CSV of a block model layer read straight from a CSV (an older workspace file)."""
+        if spec.get("type") != "BlockModelLayer":
+            return None
+        files = [_from_text(f, self.folder) for f in spec.get("files", [])]
+        if len(files) == 1 and files[0].suffix.lower() == ".csv" and files[0].exists():
+            return files[0]
+        return None
+
     def init_database(self) -> bool:
         """Connect to the project database and make its missing tables / fields (see
         project_db). True when connected; otherwise ``database_error`` says why (server
@@ -390,6 +430,7 @@ class Workspace:
         from .project_db import init_project_database
 
         target = project_target(self.folder)
+        self.database_ready = True
         try:
             self.database_notes = init_project_database(target, self.folder)
             self.database_error = ""
@@ -518,4 +559,6 @@ class Workspace:
         now = time.time()
         ready = [p for p in new if not _recent(p, now)]
         self.known |= {_key(p) for p in ready}
-        return loadable_groups(ready, all_files), len(new) - len(ready)
+        loadable, blocks = split_block_csvs(ready)
+        self.block_csvs += blocks
+        return loadable_groups(loadable, all_files), len(new) - len(ready)

@@ -2,20 +2,21 @@ from pathlib import Path
 
 import pytest
 
-DEMO = Path(__file__).resolve().parents[1] / "surpac_demo"
+DEMO = Path(__file__).resolve().parents[1] / "demo_data"
 
 
 @pytest.fixture(scope="session")
 def demo() -> Path:
     if not DEMO.exists():
-        pytest.skip("surpac_demo folder not present")
+        pytest.skip("demo_data folder not present")
     return DEMO
 
 
 @pytest.fixture(scope="session")
-def accdb() -> Path:
-    """A Surpac Access drillhole database for the tests (the demo data's surpac.accdb)."""
-    return Path(__file__).resolve().parent / "data" / "surpac.accdb"
+def surpac_sqlite() -> Path:
+    """The demo drillholes (94 holes) as a plain SQLite drillhole database: Surpac's tables collar, survey,
+    geology, sample, weathering, translation, styles (dip negative downward), read like a Surpac database."""
+    return Path(__file__).resolve().parent / "data" / "demo_drillholes.sqlite"
 
 
 @pytest.fixture(autouse=True)

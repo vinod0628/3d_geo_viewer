@@ -39,7 +39,9 @@ def test_grid_alignment(bm_path, tmp_path):
 
 def test_cache_roundtrip(bm_path, tmp_path):
     a = read_block_csv(bm_path, cache_dir=tmp_path)
-    assert list(tmp_path.glob("*.npz"))
+    caches = list(tmp_path.glob("*.gvbm"))
+    assert caches and not list(tmp_path.glob("*.npz"))       # encrypted, never plain arrays
+    assert b"gold" not in caches[0].read_bytes()
     b = read_block_csv(bm_path, cache_dir=tmp_path)
     np.testing.assert_array_equal(a.centroids, b.centroids)
     np.testing.assert_array_equal(a.sizes, b.sizes)
@@ -262,7 +264,7 @@ def test_copies_of_a_layer_in_an_old_workspace_are_opened_once(demo, tmp_path):
 
     from geoviewer.workspace import WORKSPACE_FILE, Workspace
 
-    for f in ("block_model.csv", "ore1.dtm", "ore1.str"):
+    for f in ("ore1_bm.gvbm", "ore1.dtm", "ore1.str"):
         shutil.copy2(demo / f, tmp_path / f)          # keep the time: new files wait a moment
     ws = Workspace(tmp_path)
     layers, errors, _ = ws.load()
@@ -270,12 +272,12 @@ def test_copies_of_a_layer_in_an_old_workspace_are_opened_once(demo, tmp_path):
     data = json.loads((tmp_path / WORKSPACE_FILE).read_text(encoding="utf-8"))
     by_name = {spec["name"]: spec for spec in data["layers"]}
     survey = next(spec for spec in data["layers"] if spec["type"] == "SurveyLayer")
-    data["layers"] += [dict(by_name["block_model"], name="block_model (2)"), dict(survey, name="Pits (2)")]
+    data["layers"] += [dict(by_name["ore1_bm"], name="ore1_bm (2)"), dict(survey, name="Pits (2)")]
     (tmp_path / WORKSPACE_FILE).write_text(json.dumps(data), encoding="utf-8")
     layers2, errors2, _ = Workspace(tmp_path).load()
     names = [lay.name for lay in layers2]
-    assert "block_model (2)" not in names and "Pits (2)" not in names and not errors2
-    assert names.count("block_model") == 1 and sum(type(x).__name__ == "SurveyLayer" for x in layers2) == 1
+    assert "ore1_bm (2)" not in names and "Pits (2)" not in names and not errors2
+    assert names.count("ore1_bm") == 1 and sum(type(x).__name__ == "SurveyLayer" for x in layers2) == 1
     Workspace(tmp_path).save(layers2, None)
     saved = json.loads((tmp_path / WORKSPACE_FILE).read_text(encoding="utf-8"))
     assert "Pits (2)" not in [spec["name"] for spec in saved["layers"]]

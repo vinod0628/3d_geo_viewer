@@ -1,5 +1,7 @@
-"""Survey Manager: main pits and their branches, and each pit's traverse entered setup by
-setup, with a live plan map of the centre line and the computed coordinates.
+"""Pit Manager: main pits and their branches, and each pit's traverse entered setup by setup,
+with a live plan map of the centre line and the computed coordinates; and the designed pits
+(drives designed with the route designer and saved to the database): their name, profile, note
+and centre line points can be changed here, or the designed pit deleted.
 
 Every change is computed at once (nothing is written until Save pit). Angles are typed as
 "120 30 00" or "120.5" and shown as 120°30′00″.
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
@@ -51,6 +54,8 @@ from ..scene.survey import STATUS_COLORS, pit_paths
 from . import theme
 from .icons import icon
 
+DESIGN_ROLE = Qt.UserRole + 1           # tree items of designed pits: the design id
+GROUP_ROLE = Qt.UserRole + 2            # the "Designed Pits" group item
 ANGLE_HINT = N_("Type 120 30 00 (degrees minutes seconds) or 120.5; shown as 120°30′00″.")
 BEARING_TYPE_TEXT = {"magnetic": N_("Magnetic (compass)"), "true": N_("True (gyro)"), "grid": N_("Grid")}
 
@@ -82,6 +87,14 @@ def _f(text):
     """A number from a field ("" -> None); ValueError for anything else."""
     t = str(text or "").strip().replace(",", "")
     return float(t) if t else None
+
+
+def _fnum(text):
+    """A number from a field; None for empty or not a number."""
+    try:
+        return _f(text)
+    except ValueError:
+        return None
 
 
 def _wide(size, edit, sample):
@@ -197,6 +210,8 @@ class PlanMap(QWidget):
         self.marker = 1.0                  # station symbol size factor (smaller on the PNG export)
         self.uniform = False               # the PNG export: every pit alike in grey (no highlight,
                                            # no arrows), every station marked and named
+        self.designs: list = []            # designed pits: (id, [(x, y, z)]) - dashed green
+        self.current_design = None         # the designed pit being edited (its points numbered)
 
     def _col(self, name) -> QColor:
         return QColor(self.palette_override.get(name) or getattr(theme, name))
@@ -210,6 +225,7 @@ class PlanMap(QWidget):
         head = 30 if title else 0
         off = PlanMap()
         off.coords, off.status, off.lines, off.current = self.coords, self.status, self.lines, self.current
+        off.designs, off.current_design = self.designs, self.current_design
         off.known, off.selected = self.known, None                 # no selected-leg highlight on paper
         off.palette_override = PRINT_COLORS
         off.marker = PRINT_MARKER
@@ -240,9 +256,11 @@ class PlanMap(QWidget):
             raise OSError(tr("The image could not be written:\n{path}", path=path))
         return img.width(), img.height()
 
-    def set_data(self, coords, status, lines, current, selected, known, refit=False):
+    def set_data(self, coords, status, lines, current, selected, known, refit=False, designs=None,
+                 current_design=None):
         self.coords, self.status, self.lines, self.current = coords, status, lines, current
         self.selected, self.known = selected, known
+        self.designs, self.current_design = list(designs or []), current_design
         n_own = sum(1 for pid, names in lines if pid == current for n in names if n in coords)
         grew, self._n_own = n_own > getattr(self, "_n_own", 0), n_own
         if refit or self._view is None or (grew and not self._shows_current()):   # a zoom the user chose is kept
@@ -266,7 +284,9 @@ class PlanMap(QWidget):
 
     def fit(self):
         own = [self.coords[n] for pid, names in self.lines if pid == self.current for n in names if n in self.coords]
-        pts = own if len(own) >= 2 else [c for c in self.coords.values()]
+        own += [q for did, pts in self.designs if did == self.current_design for q in pts]
+        pts = own if len(own) >= 2 else [c for c in self.coords.values()] + [q for _d, pts in self.designs
+                                                                              for q in pts]
         if not pts:
             self._view = None
             return
@@ -335,6 +355,23 @@ class PlanMap(QWidget):
                         _arrow(p, pa, pb, QColor("#f0a24a") if sel else self._col("ACCENT"))
                     if sel:
                         p.setPen(QPen(self._col("ACCENT"), 2.5))
+        # designed pits: dashed; the one being edited bold, its points numbered
+        for did, pts in sorted(self.designs, key=lambda t: t[0] == self.current_design):
+            if len(pts) < 2:
+                continue
+            mine = did == self.current_design and not self.uniform
+            col = QColor(PRINT_LINE) if self.uniform else QColor("#4ce67a" if mine else "#3f8f58")
+            p.setPen(QPen(col, 3.0 if mine else 1.4, Qt.DashLine))
+            q = [self._to_px(x[0], x[1]) for x in pts]
+            for a, b in zip(q, q[1:]):
+                p.drawLine(a, b)
+            if mine:
+                p.setPen(QPen(self._col("TEXT"), 1.0))
+                p.setBrush(QColor("#4ce67a"))
+                for k, c in enumerate(q, start=1):
+                    p.drawEllipse(c, 4.0, 4.0)
+                    p.drawText(c + QPointF(6, -6), str(k))
+                p.setBrush(Qt.NoBrush)
         # stations of the edited pit (and known ones); on the PNG every station
         f.setPointSizeF(7.5 if self.uniform else 8.5)
         p.setFont(f)
@@ -586,13 +623,14 @@ class _ExportPitsDialog(QDialog):
 
 class SurveyManager(QDialog):
     changed = Signal()            # the database was written: read the survey layer again
+    geology_requested = Signal(object)   # pit id: open Pit Geology at that pit
 
     SUMMARY = ["#", N_("At"), N_("Direction from"), N_("Foresight"), N_("Bearing (grid)"), N_("HD (m)"), "ΔZ (m)",
                N_("Check")]             # headers: tr() where shown
 
     def __init__(self, store: SurveyStore, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(tr("Survey"))
+        self.setWindowTitle(tr("Pit Manager"))
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)        # can be maximised
         self.resize(1320, 800)
@@ -602,6 +640,8 @@ class SurveyManager(QDialog):
         self.setups = {}
         self.settings = {}
         self.pid = None
+        self.designs = []                   # designed pits (survey_store.DesignPit)
+        self.did = None                     # the designed pit shown (then self.pid is None)
         self.rows: list[SetupRow] = []
         self.cur = -1
         self.dirty = False
@@ -622,7 +662,8 @@ class SurveyManager(QDialog):
         b_branch.setToolTip(tr("A branch of the selected pit, starting at one of its stations"))
         b_branch.clicked.connect(self.new_branch)
         b_del = QPushButton(icon("delete-outline"), tr("Delete"))
-        b_del.setToolTip(tr("Delete the selected pit, its branches, setups and stations"))
+        b_del.setToolTip(tr("Delete the selected pit, its branches, setups and stations - or the selected "
+                            "designed pit"))
         b_del.clicked.connect(self.delete_pit)
         b_set = QPushButton(icon("cog-outline"), tr("Survey settings ..."))
         b_set.setToolTip(tr("Closure tolerance, magnetic declination and grid convergence"))
@@ -632,6 +673,17 @@ class SurveyManager(QDialog):
         b_exp.setToolTip(tr("Save all pits, or the selected pit with its branches:\n"
                             "centre lines as a shapefile (.shp), or the drives as Surpac solids (.dtm + .str)"))
         b_exp.clicked.connect(self.export_pits)
+        b_imp = QPushButton(icon("database-import-outline"), tr("Import from Excel ..."))
+        b_imp.setToolTip(tr("Add or update pits and their setups from an Excel workbook (a template to fill in "
+                            "is provided)"))
+        b_imp.clicked.connect(self.import_excel)
+        b_route = QPushButton(icon("map-marker-path", "#f0b429"), tr("Design a route ..."))
+        b_route.setToolTip(tr("Design a new drive from a station to a target: within a gradient limit and away from "
+                              "old workings and other drives (worked out on this computer)"))
+        b_route.clicked.connect(self.design_route)
+        b_geo = QPushButton(icon("layers-outline"), tr("Pit geology ..."))
+        b_geo.setToolTip(tr("The rocks, structures and samples mapped in the selected pit (Ctrl+J)"))
+        b_geo.clicked.connect(lambda: self.geology_requested.emit(self.pid))
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
@@ -642,7 +694,10 @@ class SurveyManager(QDialog):
         r.addWidget(b_branch)
         lv.addLayout(r)
         lv.addWidget(b_del)
+        lv.addWidget(b_imp)
         lv.addWidget(b_exp)
+        lv.addWidget(b_route)
+        lv.addWidget(b_geo)
         lv.addWidget(b_set)
 
         # middle: pit header, setups list, setup form, messages
@@ -721,6 +776,10 @@ class SurveyManager(QDialog):
         for b in (b_add, b_rm, b_up, b_dn):
             trow.addWidget(b)
         trow.addStretch(1)
+        self.b_doctor = QPushButton(icon("stethoscope", "#f0b429"), tr("Closure check"))
+        self.b_doctor.setToolTip(tr("The traverse does not close? Find the reading mistake that best explains it"))
+        self.b_doctor.clicked.connect(self.closure_check)
+        trow.addWidget(self.b_doctor)
 
         self.form = self._setup_form()
         self.msg = QLabel("")
@@ -764,9 +823,12 @@ class SurveyManager(QDialog):
         right.addWidget(self.coords)
         right.setSizes([480, 240])
 
+        self.mid_stack = QStackedWidget()           # a surveyed pit | a designed pit
+        self.mid_stack.addWidget(mid)
+        self.mid_stack.addWidget(self._design_page())
         split = QSplitter()
         split.addWidget(left)
-        split.addWidget(mid)
+        split.addWidget(self.mid_stack)
         split.addWidget(right)
         split.setSizes([220, 620, 480])
 
@@ -775,7 +837,7 @@ class SurveyManager(QDialog):
         self.b_save = QPushButton(icon("content-save-outline"), tr("Save pit"))
         self.b_save.clicked.connect(self.save)
         self.b_discard = QPushButton(icon("undo"), tr("Discard changes"))
-        self.b_discard.clicked.connect(lambda: self._show_pit(self.pid))
+        self.b_discard.clicked.connect(self._discard)
         close = QPushButton(tr("Close"))
         close.setToolTip(tr("Close the window (asks to save changes first)"))
         self.b_save.setToolTip(tr("Write this pit (name, profile, setups) to the database; the drives in the view "
@@ -791,6 +853,7 @@ class SurveyManager(QDialog):
         v.addWidget(split, 1)
         v.addLayout(bottom)
         self._hints()
+        self._layout_form()                         # only the chosen method's fields, also before a pit is shown
         self._set_dirty(False)
 
     # --- the setup form -------------------------------------------------------------------------
@@ -1036,16 +1099,19 @@ class SurveyManager(QDialog):
             self.store.prepare()
             self._reload()
         except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self.parent(), tr("Survey"), tr("The project database cannot be used:\n{e}", e=e))
+            QMessageBox.warning(self.parent(), tr("Pit Manager"), tr("The project database cannot be used:\n{e}",
+                                                                     e=e))
             return False
         self.status.setText(tr("Database: {name}", name=self.store.target.short))
         return True
 
     def _reload(self, select=None) -> None:
+        """Read the pits (and designed pits) again; ``select``: a pit id, or ("d", design id)."""
         self.pits = self.store.pits()
         self.stations = self.store.stations()
         self.setups = self.store.setups()
         self.settings = self.store.settings()
+        self.designs = self.store.designs()
         self.tree.blockSignals(True)
         self.tree.clear()
         items = {}
@@ -1060,8 +1126,32 @@ class SurveyManager(QDialog):
         for p in self.pits:
             parent = items.get(p.parent_id)
             (parent.addChild if parent is not None else self.tree.addTopLevelItem)(items[p.id])
+        d_items = {}
+        if self.designs:                            # after the pits: the designed pits
+            g = QTreeWidgetItem([tr("Designed Pits")])
+            g.setData(0, GROUP_ROLE, "designs")
+            g.setIcon(0, icon("pencil-ruler"))
+            g.setToolTip(0, tr("Drives designed with the route designer and saved to the database (not surveyed)"))
+            f = g.font(0)
+            f.setBold(True)
+            g.setFont(0, f)
+            self.tree.addTopLevelItem(g)
+            for x in self.designs:
+                it = QTreeWidgetItem([x.name])
+                it.setData(0, DESIGN_ROLE, x.id)
+                it.setIcon(0, icon("vector-polyline", "#4ce67a"))
+                it.setToolTip(0, tr("Designed pit {name}: from {a} to {b}, {m:,.0f} m", name=x.name,
+                                    a=x.start_name or "-", b=x.target_name or "-", m=x.length))
+                g.addChild(it)
+                d_items[x.id] = it
         self.tree.expandAll()
         self.tree.blockSignals(False)
+        if isinstance(select, tuple) and select[1] in d_items:
+            self.tree.setCurrentItem(d_items[select[1]])
+            return
+        if select is None and self.did in d_items:
+            self.tree.setCurrentItem(d_items[self.did])
+            return
         target = select if select in items else (self.pid if self.pid in items else
                                                  (self.pits[0].id if self.pits else None))
         if target is not None:
@@ -1069,18 +1159,45 @@ class SurveyManager(QDialog):
         else:
             self._show_pit(None)
 
+    def reload_designs(self) -> None:
+        """The designed pits changed elsewhere (saved by the route designer, renamed or deleted in the layers
+        list): the tree follows; the pit being edited keeps its changes."""
+        keep = ("d", self.did) if self.did is not None else None
+        self._reload(select=keep)
+        if self.did is not None and not self.dirty:
+            if any(x.id == self.did for x in self.designs):
+                self._show_design(self.did)
+            else:
+                self._show_pit(self.pits[0].id if self.pits else None)
+
+    @staticmethod
+    def _key(item):
+        if item is None:
+            return None
+        if item.data(0, GROUP_ROLE) is not None:
+            return ("g", None)
+        if item.data(0, DESIGN_ROLE) is not None:
+            return ("d", item.data(0, DESIGN_ROLE))
+        return ("p", item.data(0, Qt.UserRole))
+
+    def _shown_key(self):
+        return ("d", self.did) if self.did is not None else ("p", self.pid)
+
     def _pit_clicked(self, item, _prev) -> None:
-        pid = item.data(0, Qt.UserRole) if item is not None else None
-        if pid == self.pid:
+        key = self._key(item) or ("p", None)
+        if key == self._shown_key() or key[0] == "g":      # the group: what is shown stays
             return
         if not self._leave():
             self.tree.blockSignals(True)
             for it in self._all_items():
-                if it.data(0, Qt.UserRole) == self.pid:
+                if self._key(it) == self._shown_key():
                     self.tree.setCurrentItem(it)
             self.tree.blockSignals(False)
             return
-        self._show_pit(pid)
+        if key[0] == "d":
+            self._show_design(key[1])
+        else:
+            self._show_pit(key[1])
 
     def _all_items(self):
         out, todo = [], [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
@@ -1092,6 +1209,9 @@ class SurveyManager(QDialog):
 
     def _show_pit(self, pid) -> None:
         self.pid = pid
+        self.did = None
+        self.mid_stack.setCurrentIndex(0)
+        self.b_save.setText(tr("Save pit"))
         p = next((q for q in self.pits if q.id == pid), None)
         self._filling = True
         if p is None:
@@ -1320,7 +1440,7 @@ class SurveyManager(QDialog):
             self._set_dirty(True)
 
     def _set_dirty(self, on) -> None:
-        self.dirty = on and self.pid is not None
+        self.dirty = on and (self.pid is not None or self.did is not None)
         self.b_save.setEnabled(self.dirty)
         self.b_discard.setEnabled(self.dirty)
 
@@ -1436,7 +1556,15 @@ class SurveyManager(QDialog):
         if 0 <= self.cur < len(self.rows) and self.rows[self.cur].fs:
             sel = (self.rows[self.cur].at, self.rows[self.cur].fs)
         known = {s.name for s in self.stations if s.kind == "known"}
-        self.map.set_data(self.net.coords, self.net.status, lines, self.pid, sel, known, refit)
+        designs = [(x.id, x.points) for x in self.designs]
+        if self.did is not None:
+            try:
+                edited = self._d_points()
+            except ValueError:
+                edited = None
+            if edited:
+                designs = [(i, edited if i == self.did else pts) for i, pts in designs]
+        self.map.set_data(self.net.coords, self.net.status, lines, self.pid, sel, known, refit, designs, self.did)
 
     # --- pits ----------------------------------------------------------------------------------------
     def new_main_pit(self) -> None:
@@ -1484,6 +1612,9 @@ class SurveyManager(QDialog):
             return
 
     def delete_pit(self) -> None:
+        if self.did is not None:
+            self.delete_design()
+            return
         p = next((q for q in self.pits if q.id == self.pid), None)
         if p is None:
             return
@@ -1606,6 +1737,59 @@ class SurveyManager(QDialog):
         self.status.setText(tr("Exported {name}", name=path.name))
         QMessageBox.information(self, tr("Export pits"), text)
 
+    def import_excel(self) -> None:
+        """Pits and setups from an Excel workbook (the template filled in)."""
+        from ..io import survey_import as si
+        from .excel_import import ExcelImportDialog
+
+        if not self._leave():
+            return
+        dlg = ExcelImportDialog(
+            self, title=tr("Import survey from Excel"),
+            intro=tr("Add pits and their setups at once: save the template, fill in its sheets pits and setups "
+                     "in Excel, then choose the file here. The traverse is computed during the check, so "
+                     "problems show before anything is imported. A pit already in the database (same name) "
+                     "is replaced - its setups too, when the setups sheet has rows for it - or skipped."),
+            existing=tr("Pits already in the database"), folder=self._export_folder(),
+            template_name="survey_template.xlsx",
+            save_template=si.save_template,
+            read=lambda path: si.read_import(self.store, path),
+            apply=lambda plan, replace: si.apply_import(self.store, plan, replace),
+            result_text=si.result_text)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._last_export_dir = dlg.folder
+        self.dirty = False
+        select, self.pid = self.pid, None             # show the (maybe replaced) pit again
+        self._reload(select=select)
+        self.status.setText(dlg.result_message())
+        self.changed.emit()
+
+    # --- decision support (AI, offline) ---------------------------------------------------------
+    def closure_check(self) -> None:
+        """Find the single reading mistake that best explains the pit's misclosure."""
+        from .closure_dialog import ClosureDialog
+
+        if self.pid is None:
+            QMessageBox.information(self, tr("Closure check"), tr("Select a pit first."))
+            return
+        ClosureDialog(self).exec()
+
+    def design_route(self) -> None:
+        """Design a new drive (non-modal, next to this window)."""
+        from .route_dialog import RouteDialog
+
+        if self.net is None or not self.net.coords:
+            QMessageBox.information(self, tr("Route designer"), tr("There are no stations with coordinates yet: add "
+                                                                   "a main pit with its entrance first."))
+            return
+        dlg = getattr(self, "route_dialog", None)
+        if dlg is None or not dlg.isVisible():
+            self.route_dialog = dlg = RouteDialog(self)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     def export_map_png(self) -> None:
         """The plan map as shown, as a 300 dpi PNG on white."""
         if not self._export_allowed(tr("Export map")):
@@ -1632,6 +1816,8 @@ class SurveyManager(QDialog):
         self.status.setText(tr("Exported {name} ({w} x {h} px, 300 dpi)", name=path.name, w=w, h=h))
 
     def save(self) -> bool:
+        if self.did is not None:
+            return self._save_design()
         if self.pid is None:
             return True
         try:
@@ -1663,7 +1849,7 @@ class SurveyManager(QDialog):
     def _leave(self) -> bool:
         if not self.dirty:
             return True
-        ans = QMessageBox.question(self, tr("Survey"), tr("Save the changes to this pit?"),
+        ans = QMessageBox.question(self, tr("Pit Manager"), tr("Save the changes to this pit?"),
                                    QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         if ans == QMessageBox.Save:
             return self.save()
@@ -1671,6 +1857,274 @@ class SurveyManager(QDialog):
             self.dirty = False
             return True
         return False
+
+    def _discard(self) -> None:
+        if self.did is not None:
+            self._show_design(self.did)
+        else:
+            self._show_pit(self.pid)
+
+    # --- designed pits ------------------------------------------------------------------------------
+    def _design_page(self) -> QWidget:
+        """The middle of the window for a designed pit: name, profile, note and its centre line points."""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.d_title = QLabel()
+        self.d_title.setStyleSheet("font-size: 13pt; font-weight: 600;")
+        self.d_name = QLineEdit()
+        self.d_note = QLineEdit()
+        self.d_note.setPlaceholderText(tr("e.g. option B, approved, to be checked ..."))
+        self.d_w, self.d_h = QDoubleSpinBox(), QDoubleSpinBox()
+        for s in (self.d_w, self.d_h):
+            s.setRange(0.5, 50)
+            s.setDecimals(1)
+            s.setSuffix(" m")
+            s.valueChanged.connect(self._design_edited)
+        self.d_level = QComboBox()
+        for k, val in STATION_LEVELS.items():
+            self.d_level.addItem(tr(val), k)
+        self.d_level.setToolTip(tr("Where the points are in the drive's profile"))
+        self.d_level.currentIndexChanged.connect(self._design_edited)
+        for w in (self.d_name, self.d_note):
+            w.textEdited.connect(self._design_edited)
+        head = QGridLayout()
+        head.addWidget(QLabel(tr("Name")), 0, 0)
+        head.addWidget(self.d_name, 0, 1)
+        head.addWidget(QLabel(tr("Profile")), 1, 0)
+        prof = QHBoxLayout()
+        prof.addWidget(self.d_w)
+        prof.addWidget(QLabel(tr("wide x")))
+        prof.addWidget(self.d_h)
+        prof.addWidget(QLabel(tr("high, stations in the")))
+        prof.addWidget(self.d_level)
+        prof.addStretch(1)
+        head.addLayout(prof, 1, 1)
+        head.addWidget(QLabel(tr("Note")), 2, 0)
+        head.addWidget(self.d_note, 2, 1)
+        self.d_info = QLabel()
+        self.d_info.setWordWrap(True)
+        self.d_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.d_table = QTableWidget(0, 6)
+        self.d_table.setHorizontalHeaderLabels(["#", tr("X (East)"), tr("Y (North)"), "Z", tr("Leg length (m)"),
+                                                tr("Gradient")])
+        self.d_table.verticalHeader().setVisible(False)
+        self.d_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.d_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.d_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.d_table.setToolTip(tr("The centre line of the designed drive, point by point: double-click X, Y or Z "
+                                   "to change it"))
+        self.d_table.itemChanged.connect(self._design_point_changed)
+        b_add = QPushButton(icon("plus"), tr("Insert point"))
+        b_add.setToolTip(tr("A new point halfway along the leg after the selected point (at the end: the last leg "
+                            "carried on)"))
+        b_add.clicked.connect(self.insert_design_point)
+        b_rm = QPushButton(icon("delete-outline"), tr("Delete point"))
+        b_rm.setToolTip(tr("Delete the selected point (2 are needed at least)"))
+        b_rm.clicked.connect(self.delete_design_point)
+        row = QHBoxLayout()
+        row.addWidget(b_add)
+        row.addWidget(b_rm)
+        row.addStretch(1)
+        hint = QLabel(tr("A designed pit is a plan, not a survey: it is kept apart from the surveyed pits and "
+                         "nothing is computed from it. Save writes the changes to the database; the 3D view "
+                         "follows."))
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.MUTED};")
+        v.addWidget(self.d_title)
+        v.addLayout(head)
+        v.addWidget(self.d_info)
+        v.addWidget(self.d_table, 1)
+        v.addLayout(row)
+        v.addWidget(hint)
+        return page
+
+    def _design(self):
+        return next((x for x in self.designs if x.id == self.did), None)
+
+    def _show_design(self, did) -> None:
+        x = next((q for q in self.designs if q.id == did), None)
+        if x is None:
+            self._show_pit(None)
+            return
+        self.pid, self.did, self.rows, self.cur = None, did, [], -1
+        self.mid_stack.setCurrentIndex(1)
+        self.b_save.setText(tr("Save designed pit"))
+        self._filling = True
+        self.d_title.setText(tr("Designed pit {name}", name=x.name))
+        self.d_name.setText(x.name)
+        self.d_note.setText(x.note)
+        self.d_w.setValue(x.profile_width)
+        self.d_h.setValue(x.profile_height)
+        self.d_level.setCurrentIndex(max(self.d_level.findData(x.station_level), 0))
+        t = self.d_table
+        t.blockSignals(True)
+        t.setRowCount(len(x.points))
+        for k, p in enumerate(x.points):
+            for c, val in enumerate((p[0], p[1], p[2]), start=1):
+                it = QTableWidgetItem(f"{val:.3f}")
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                t.setItem(k, c, it)
+        t.blockSignals(False)
+        self._filling = False
+        self._design_numbers()
+        self._set_dirty(False)
+        self._recompute(refit=True)
+
+    def _d_points(self) -> list:
+        """The points as typed in the table; ValueError naming the first one that is not a number."""
+        out = []
+        for k in range(self.d_table.rowCount()):
+            vals = []
+            for c in (1, 2, 3):
+                it = self.d_table.item(k, c)
+                v = _fnum(it.text() if it is not None else "")
+                if v is None:
+                    raise ValueError(tr("Point {n}: X, Y and Z must be numbers", n=k + 1))
+                vals.append(v)
+            out.append(tuple(vals))
+        return out
+
+    def _design_numbers(self) -> None:
+        """Point numbers, leg lengths and gradients, and the summary above the table, from the points as typed."""
+        from ..ai.route_planner import ratio_text
+        from ..io.survey_store import design_measures
+
+        t = self.d_table
+        t.blockSignals(True)
+        good = []
+        for k in range(t.rowCount()):
+            vals = [_fnum(t.item(k, c).text()) if t.item(k, c) is not None else None for c in (1, 2, 3)]
+            good.append(None if None in vals else tuple(vals))
+            for c, text in ((0, str(k + 1)), (4, ""), (5, "")):
+                it = QTableWidgetItem(text)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                t.setItem(k, c, it)
+            for c in (1, 2, 3):
+                it = t.item(k, c)
+                if it is not None:
+                    it.setForeground(QColor(theme.TEXT) if _fnum(it.text()) is not None else QColor("#ff6b6b"))
+            if k and good[k] is not None and good[k - 1] is not None:
+                a, b = good[k - 1], good[k]
+                plan = math.hypot(b[0] - a[0], b[1] - a[1])
+                t.item(k, 4).setText(f"{math.sqrt(plan ** 2 + (b[2] - a[2]) ** 2):,.1f}")
+                t.item(k, 5).setText(ratio_text((b[2] - a[2]) / plan) if plan > 1e-9 else tr("vertical"))
+        t.blockSignals(False)
+        x = self._design()
+        if x is None:
+            return
+        pit = next((p for p in self.pits if p.id == x.start_pit_id), None)
+        lines = [tr("From {a}{pit} to {b}", a=x.start_name or "-", pit=f" ({pit.name})" if pit else "",
+                    b=x.target_name or "-")]
+        if None in good or len(good) < 2:
+            lines.append("<span style='color:#ff6b6b'>⚠ " + tr("Every point needs X, Y and Z (2 points at least)")
+                         + "</span>")
+        else:
+            length, climb, steepest = design_measures(good)
+            text = tr("{m:,.1f} m long, height change {h:+,.1f} m, steepest {g}", m=length, h=climb,
+                      g=ratio_text(steepest))
+            if x.gradient and steepest > x.gradient * 1.001:
+                text += " - <span style='color:#f0a24a'>" + tr("steeper than the {g} it was designed for",
+                                                                g=ratio_text(x.gradient)) + "</span>"
+            lines.append(text)
+        if x.created_at:
+            lines.append(tr("Saved from the route designer {at}", at=x.created_at.replace("T", " ")))
+        self.d_info.setText("<br>".join(lines))
+
+    def _design_edited(self, *_a) -> None:
+        if not self._filling and self.did is not None:
+            self._set_dirty(True)
+
+    def _design_point_changed(self, item) -> None:
+        if self._filling or item.column() not in (1, 2, 3):
+            return
+        self._set_dirty(True)
+        self._design_numbers()
+        self._redraw_map()
+
+    def insert_design_point(self) -> None:
+        try:
+            pts = self._d_points()
+        except ValueError as e:
+            QMessageBox.information(self, tr("Insert point"), str(e))
+            return
+        if not pts:
+            return
+        k = self.d_table.currentRow()
+        k = len(pts) - 1 if k < 0 else k
+        if k < len(pts) - 1:
+            new = tuple((a + b) / 2.0 for a, b in zip(pts[k], pts[k + 1]))
+        else:
+            prev = pts[k - 1] if k else (pts[k][0] - 10.0, pts[k][1], pts[k][2])
+            new = tuple(2 * b - a for a, b in zip(prev, pts[k]))
+        self._set_design_points(pts[:k + 1] + [new] + pts[k + 1:], k + 1)
+
+    def delete_design_point(self) -> None:
+        k = self.d_table.currentRow()
+        if k < 0:
+            return
+        if self.d_table.rowCount() <= 2:
+            QMessageBox.information(self, tr("Delete point"), tr("A designed pit needs at least 2 points"))
+            return
+        self.d_table.removeRow(k)
+        self._set_dirty(True)
+        self._design_numbers()
+        self._redraw_map()
+        self.d_table.selectRow(min(k, self.d_table.rowCount() - 1))
+
+    def _set_design_points(self, pts, select=None) -> None:
+        t = self.d_table
+        t.blockSignals(True)
+        t.setRowCount(len(pts))
+        for k, p in enumerate(pts):
+            for c, val in enumerate(p, start=1):
+                it = QTableWidgetItem(f"{val:.3f}")
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                t.setItem(k, c, it)
+        t.blockSignals(False)
+        self._set_dirty(True)
+        self._design_numbers()
+        self._redraw_map()
+        if select is not None:
+            t.selectRow(select)
+
+    def _save_design(self) -> bool:
+        did = self.did
+        try:
+            self.store.update_design(did, self.d_name.text(), self.d_note.text(),
+                                     (self.d_w.value(), self.d_h.value(), self.d_level.currentData()),
+                                     self._d_points())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, tr("Save designed pit"), tr("The designed pit was not saved:\n{e}", e=e))
+            return False
+        self.dirty = False
+        self._reload(select=("d", did))
+        self._show_design(did)
+        self.status.setText(tr("Saved"))
+        self.changed.emit()
+        return True
+
+    def delete_design(self) -> None:
+        x = self._design()
+        if x is None:
+            return
+        if QMessageBox.question(self, tr("Delete designed pit"),
+                                tr("Delete the designed pit {name} from the database?\n"
+                                   "The surveyed pits are not changed.", name=x.name)) != QMessageBox.Yes:
+            return
+        try:
+            self.store.delete_design(x.id)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, tr("Delete designed pit"), str(e))
+            return
+        self.dirty = False
+        self.did = None
+        self._reload(select=self.pits[0].id if self.pits else None)
+        if self.did is None and self.mid_stack.currentIndex() == 1:
+            self._show_pit(self.pits[0].id if self.pits else None)
+        self.status.setText(tr("Deleted {name}", name=x.name))
+        self.changed.emit()
 
     def closeEvent(self, e) -> None:
         if not self._leave():

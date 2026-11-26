@@ -28,6 +28,8 @@ from ..scene.survey import SurveyLayer
 from .icons import icon
 
 PIT_ROLE = Qt.UserRole + 1          # pit items under the survey layer: the pit id
+DESIGN_ROLE = Qt.UserRole + 2       # designed pit items (under "Designed Pits"): the design id
+GROUP_ROLE = Qt.UserRole + 3        # the "Designed Pits" group item: "designs"
 
 
 def database_kind(layer) -> int | None:
@@ -46,7 +48,7 @@ def has_content(layer) -> bool:
     """False for a project-database layer with nothing stored yet (no pits / drillholes /
     mined shapes): it is listed, greyed out."""
     if isinstance(layer, SurveyLayer):
-        return layer.data is not None and bool(layer.data.pits)
+        return layer.data is not None and (bool(layer.data.pits) or bool(layer.data.designs))
     if isinstance(layer, DrillholeLayer) and layer.source == "database":
         return layer.data is not None and len(layer.data.collars) > 0
     if isinstance(layer, MinedShapesLayer):
@@ -54,7 +56,7 @@ def has_content(layer) -> bool:
     return True
 
 
-EMPTY_TIPS = {0: N_("No pits yet - add them with Survey (Ctrl+U)"),
+EMPTY_TIPS = {0: N_("No pits yet - add them with the Pit Manager (Ctrl+U)"),
               1: N_("No drillholes yet - add them with the Drillhole Manager (Ctrl+D)"),
               2: N_("No mined shapes yet - draw an outline (Ctrl+L, 2D view) or load a mined solid "
                     "in the Reserve window")}
@@ -152,6 +154,14 @@ class LayerTree(QWidget):
     pit_selected = Signal(object, object)               # survey layer, pit id
     pit_visibility_changed = Signal(object, object, bool)
     pit_zoom_requested = Signal(object, object)
+    pit_geology_requested = Signal(object, object)    # (survey layer, pit id): open Pit Geology
+    design_selected = Signal(object, object)            # survey layer, designed pit id
+    design_visibility_changed = Signal(object, object, bool)
+    designs_visibility_changed = Signal(object, bool)   # the "Designed Pits" group switched on / off
+    designs_selected = Signal(object)                   # survey layer: its "Designed Pits" group selected
+    design_zoom_requested = Signal(object, object)      # survey layer, design id (None: all of them)
+    design_rename_requested = Signal(object, object)
+    design_delete_requested = Signal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -261,18 +271,29 @@ class LayerTree(QWidget):
             it = self.tree.topLevelItem(i)
             if self._layer(it) is old:
                 cur = self.tree.currentItem()
-                cur_pit = cur.data(0, PIT_ROLE) if cur is not None and self._layer(cur) is old else None
+                mine = cur is not None and self._layer(cur) is old
+                cur_pit = cur.data(0, PIT_ROLE) if mine else None
+                cur_design = cur.data(0, DESIGN_ROLE) if mine else None
+                cur_group = mine and cur.data(0, GROUP_ROLE) is not None
                 self.tree.blockSignals(True)
                 it.setData(0, Qt.UserRole, new)
                 it.setText(0, new.name)
                 self._set_enabled(it, new)
                 it.setCheckState(0, Qt.Checked if new.visible else Qt.Unchecked)
                 again = self._fill_pits(it, new, select=cur_pit)
+                again_d = self._find_child(it, DESIGN_ROLE, cur_design) if cur_design is not None else None
+                again_g = self._find_child(it, GROUP_ROLE, "designs") if cur_group else None
                 self.tree.blockSignals(False)
                 if again is not None:
                     self.tree.setCurrentItem(again)
                     self.pit_selected.emit(new, cur_pit)
-                elif cur is not None and (cur is it or cur_pit is not None):
+                elif again_d is not None:
+                    self.tree.setCurrentItem(again_d)
+                    self.design_selected.emit(new, cur_design)
+                elif again_g is not None:
+                    self.tree.setCurrentItem(again_g)
+                    self.designs_selected.emit(new)
+                elif cur is not None and (cur is it or cur_pit is not None or cur_design is not None or cur_group):
                     self.tree.setCurrentItem(it)
                     self.layer_selected.emit(new)
                 return
@@ -286,17 +307,24 @@ class LayerTree(QWidget):
             todo += [it.child(i) for i in range(it.childCount())]
         return out
 
+    def _find_child(self, layer_item, role, value):
+        return next((c for c in self._pit_items(layer_item) if c.data(0, role) == value), None)
+
     def _fill_pits(self, it, layer, select=None):
         """The survey layer's pits under its item: main pits, their branches nested below
-        (checkbox = shown, swatch = colour). Expanded / collapsed pits stay so on a reload.
-        Returns the item of pit ``select`` when it is still there."""
+        (checkbox = shown, swatch = colour), then the "Designed Pits" group when there are designed
+        pits. Expanded / collapsed pits stay so on a reload. Returns the item of pit ``select`` when
+        it is still there."""
         if not isinstance(layer, SurveyLayer):
             return None
-        collapsed = {c.data(0, PIT_ROLE) for c in self._pit_items(it) if not c.isExpanded() and c.childCount()}
+        collapsed = {c.data(0, PIT_ROLE) for c in self._pit_items(it)
+                     if not c.isExpanded() and c.childCount() and c.data(0, PIT_ROLE) is not None}
+        group = self._find_child(it, GROUP_ROLE, "designs")
+        group_open = group.isExpanded() if group is not None else True
         was_open = it.isExpanded() or it.childCount() == 0
         it.takeChildren()
         d = layer.data
-        if d is None or not d.pits:
+        if d is None or (not d.pits and not d.designs):
             return None
         items, found = {}, None
         ids = {x.id for x in d.pits}
@@ -331,10 +359,38 @@ class LayerTree(QWidget):
             if len(rest) == len(pending):                    # a loop of parents: list them at the top
                 top |= {q.id for q in rest}
             pending = rest
+        if d.designs:
+            self._fill_designs(it, layer).setExpanded(group_open)
         it.setExpanded(was_open)
         for pid, c in items.items():
             c.setExpanded(pid not in collapsed)
         return found
+
+    def _fill_designs(self, it, layer):
+        """The "Designed Pits" group (checkbox: all of them shown) and one item per designed pit."""
+        g = QTreeWidgetItem([tr("Designed Pits")])
+        g.setData(0, Qt.UserRole, layer)
+        g.setData(0, GROUP_ROLE, "designs")
+        g.setFlags((g.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled) & ~Qt.ItemIsDragEnabled
+                   & ~Qt.ItemIsDropEnabled)
+        g.setCheckState(0, Qt.Checked if layer.show_designs else Qt.Unchecked)
+        g.setIcon(0, icon("pencil-ruler"))
+        g.setToolTip(0, tr("Drives designed with the route designer and saved to the database (not surveyed)\n"
+                           "Tick to show, untick to hide; double-click to zoom"))
+        it.addChild(g)
+        for x in layer.data.designs:
+            c = QTreeWidgetItem([x.name])
+            c.setData(0, Qt.UserRole, layer)
+            c.setData(0, DESIGN_ROLE, x.id)
+            c.setFlags((c.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled) & ~Qt.ItemIsDragEnabled
+                       & ~Qt.ItemIsDropEnabled)
+            c.setCheckState(0, Qt.Checked if layer.design_style(x.id)["visible"] else Qt.Unchecked)
+            c.setIcon(0, swatch_icon(layer.design_color(x.id)))
+            c.setToolTip(0, tr("Designed pit {name}: from {a} to {b}, {m:,.0f} m\n"
+                               "Tick to show, untick to hide; double-click to zoom; right-click to rename or delete",
+                               name=x.name, a=x.start_name or "-", b=x.target_name or "-", m=x.length))
+            g.addChild(c)
+        return g
 
     def update_pits(self, layer: Layer) -> None:
         """Check boxes and colour swatches follow the pits' display settings."""
@@ -343,9 +399,15 @@ class LayerTree(QWidget):
             if self._layer(it) is layer:
                 self.tree.blockSignals(True)
                 for c in self._pit_items(it):
-                    pid = c.data(0, PIT_ROLE)
-                    c.setCheckState(0, Qt.Checked if layer.pit_style(pid)["visible"] else Qt.Unchecked)
-                    c.setIcon(0, swatch_icon(layer.pit_color(pid)))
+                    pid, did = c.data(0, PIT_ROLE), c.data(0, DESIGN_ROLE)
+                    if pid is not None:
+                        c.setCheckState(0, Qt.Checked if layer.pit_style(pid)["visible"] else Qt.Unchecked)
+                        c.setIcon(0, swatch_icon(layer.pit_color(pid)))
+                    elif did is not None:
+                        c.setCheckState(0, Qt.Checked if layer.design_style(did)["visible"] else Qt.Unchecked)
+                        c.setIcon(0, swatch_icon(layer.design_color(did)))
+                    elif c.data(0, GROUP_ROLE) is not None:
+                        c.setCheckState(0, Qt.Checked if layer.show_designs else Qt.Unchecked)
                 self.tree.blockSignals(False)
                 return
 
@@ -353,10 +415,18 @@ class LayerTree(QWidget):
         it = self.tree.currentItem()
         return it.data(0, PIT_ROLE) if it is not None else None
 
+    def current_design(self):
+        it = self.tree.currentItem()
+        return it.data(0, DESIGN_ROLE) if it is not None else None
+
     def _double_clicked(self, it, _col):
         pid = it.data(0, PIT_ROLE)
         if pid is not None:
             self.pit_zoom_requested.emit(self._layer(it), pid)
+        elif it.data(0, DESIGN_ROLE) is not None:
+            self.design_zoom_requested.emit(self._layer(it), it.data(0, DESIGN_ROLE))
+        elif it.data(0, GROUP_ROLE) is not None:
+            self.design_zoom_requested.emit(self._layer(it), None)
         else:
             self.zoom_requested.emit(self._layer(it))
 
@@ -401,9 +471,15 @@ class LayerTree(QWidget):
     def _current_changed(self, cur, _prev):
         layer = self._layer(cur)
         pid = cur.data(0, PIT_ROLE) if cur is not None else None
-        self.b_del.setEnabled(layer is not None and layer.removable and pid is None)
+        did = cur.data(0, DESIGN_ROLE) if cur is not None else None
+        sub = pid is not None or did is not None or (cur is not None and cur.data(0, GROUP_ROLE) is not None)
+        self.b_del.setEnabled(layer is not None and layer.removable and not sub)
         if pid is not None:
             self.pit_selected.emit(layer, pid)
+        elif did is not None:
+            self.design_selected.emit(layer, did)
+        elif cur is not None and cur.data(0, GROUP_ROLE) is not None:
+            self.designs_selected.emit(layer)
         else:
             self.layer_selected.emit(layer)
 
@@ -414,6 +490,17 @@ class LayerTree(QWidget):
             vis = item.checkState(0) == Qt.Checked
             if vis != layer.pit_style(pid)["visible"]:
                 self.pit_visibility_changed.emit(layer, pid, vis)
+            return
+        did = item.data(0, DESIGN_ROLE)
+        if layer is not None and did is not None:
+            vis = item.checkState(0) == Qt.Checked
+            if vis != layer.design_style(did)["visible"]:
+                self.design_visibility_changed.emit(layer, did, vis)
+            return
+        if layer is not None and item.data(0, GROUP_ROLE) is not None:
+            vis = item.checkState(0) == Qt.Checked
+            if vis != layer.show_designs:
+                self.designs_visibility_changed.emit(layer, vis)
             return
         if layer is not None:
             vis = item.checkState(0) == Qt.Checked
@@ -429,6 +516,23 @@ class LayerTree(QWidget):
         pid = item.data(0, PIT_ROLE)
         if pid is not None:
             m.addAction(icon("magnify-scan"), tr("Zoom to pit"), lambda: self.pit_zoom_requested.emit(layer, pid))
+            m.addAction(icon("layers-outline"), tr("Pit geology ..."),
+                        lambda: self.pit_geology_requested.emit(layer, pid))
+            m.exec(self.tree.viewport().mapToGlobal(pos))
+            return
+        did = item.data(0, DESIGN_ROLE)
+        if did is not None:
+            m.addAction(icon("magnify-scan"), tr("Zoom to designed pit"),
+                        lambda: self.design_zoom_requested.emit(layer, did))
+            m.addAction(icon("rename-box"), tr("Rename..."), lambda: self.design_rename_requested.emit(layer, did))
+            m.addSeparator()
+            m.addAction(icon("delete-outline"), tr("Delete designed pit..."),
+                        lambda: self.design_delete_requested.emit(layer, did))
+            m.exec(self.tree.viewport().mapToGlobal(pos))
+            return
+        if item.data(0, GROUP_ROLE) is not None:
+            m.addAction(icon("magnify-scan"), tr("Zoom to designed pits"),
+                        lambda: self.design_zoom_requested.emit(layer, None))
             m.exec(self.tree.viewport().mapToGlobal(pos))
             return
         m.addAction(icon("magnify-scan"), tr("Zoom to layer"), lambda: self.zoom_requested.emit(layer))

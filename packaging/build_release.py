@@ -10,7 +10,7 @@ Options:
     --no-zip       do not create the release zip
     --no-test      skip the smoke test of the built GeoViewer.exe
     --keep-work    keep distribute\\build
-    --with-demo    copy surpac_demo\\ into the release as sample data
+    --with-demo    copy demo_data\\ into the release as sample data
 
 Run through build_release.bat, or: .venv\\Scripts\\python.exe packaging\\build_release.py
 """
@@ -36,8 +36,8 @@ APP = DIST / "GeoViewer"
 EXE = APP / "GeoViewer.exe"
 SPEC = ROOT / "packaging" / "geoviewer.spec"
 LOCK = ROOT / "requirements-offline.txt"
-DEMO = ROOT / "surpac_demo"
-SMOKE_FILES = ["topo1.dtm", "ore1.dtm", "pit1.str", "topo2.dxf", "block_model.csv", "surpac.accdb"]
+DEMO = ROOT / "demo_data"
+SMOKE_FILES = ["topo1.dtm", "ore1.dtm", "pit1.str", "topo2.dxf", "ore1_bm.gvbm", "surpac.accdb"]
 # Build/test-only packages: not shipped, so not listed in the third-party notices.
 NOT_SHIPPED = {"pyinstaller", "pyinstaller-hooks-contrib", "altgraph", "pefile", "pywin32-ctypes",
                "setuptools", "pytest", "iniconfig", "pluggy", "pip"}
@@ -46,12 +46,15 @@ README = """GeoViewer {version}
 ===================
 
 Read-only 3D viewer for Surpac geological data:
-  strings (.str), DTM surfaces / solids (.dtm), block models (CSV export),
+  strings (.str), DTM surfaces / solids (.dtm), block models (.gvbm, imported from a CSV export),
   drillholes (the project database - SQLite or MySQL -, Surpac .accdb / .mdb, or
   collar + survey + interval CSV files) and DXF.
 
 Start:  GeoViewer.exe                          opens the last workspace again
-        GeoViewer.exe -w "D:\\geo\\project_1"    opens that workspace folder
+        GeoViewer.exe -w "D:\\geo\\project_1"    opens that workspace folder; when GeoViewer
+                                               is already open, that window switches to it
+                                               (a folder without geoviewer_workspace.json is
+                                               not opened: a warning shows in the status bar)
         GeoViewer.exe file1.dtm file2.str      opens files (files / folders can also be dropped)
 
 Workspace: a folder of data files. The workspace (layers, their order, display settings
@@ -207,6 +210,9 @@ Keys:   Ctrl+Shift+O open workspace   Ctrl+Shift+S save workspace as (copy to an
 
 Drillhole CSV: select the collar, survey and interval files together in the open dialog.
 Block model CSV: one row per block with centroid X/Y/Z, block size X/Y/Z and attributes.
+        A block model CSV is never shown as it is: opening one (or finding one in the
+        workspace folder) imports it into a GeoViewer block model (.gvbm) in the Block Model
+        Manager, which then offers to delete the plain-text CSV.
 Block model constraint (properties, Constraint): conditions on DTMs (inside / outside a
         solid, above / below a surface) and block values (e.g. gold >= 4), combined by
         and / or or an expression such as  a and (b or not c). The block centre is tested.

@@ -11,7 +11,9 @@ so a database that is set up and holds data keeps all of it:
 * table_updates (a version per table) and triggers on every drillhole_ / prod_ table that
   count each insert / update / delete, so Refresh sees changes made anywhere;
 * survey_pits, survey_stations, survey_setups, survey_shots, survey_settings (underground
-  traverse surveys, see io/survey_store.py);
+  traverse surveys, see io/survey_store.py), survey_designs + survey_design_points (designed
+  pits from the route designer); survey_geo_intervals, survey_geo_structures, survey_geo_samples
+  (the geology mapped in the pits, see io/pit_geology_store.py);
 * prod_settings, prod_mined_shapes (+ an index on the date); production records of
   earlier versions (production.json, production.sqlite, or geodatabase.sqlite when the
   setting is MySQL) are copied in when there are no production tables yet; outlines
@@ -28,6 +30,7 @@ from pathlib import Path
 
 from .io.database import DRILLHOLE_PREFIX, PROD_PREFIX, Target, ensure_change_tracking
 from .io.drillhole_store import DrillholeStore
+from .io.pit_geology_store import PitGeologyStore
 from .io.survey_store import SurveyStore
 from .scene.production import ProductionLog
 
@@ -43,6 +46,7 @@ def init_project_database(target: Target, folder: str | Path | None) -> list[str
         target.path.parent.mkdir(parents=True, exist_ok=True)
     notes += DrillholeStore(target).prepare()
     notes += SurveyStore(target).prepare()
+    notes += PitGeologyStore(target).prepare()
     log = ProductionLog.load(Path(folder) if folder is not None else None, target=target)
     if log.imported_from:
         notes.append(f"moved the production records from {Path(log.imported_from).name}")

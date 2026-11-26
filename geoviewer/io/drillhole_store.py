@@ -11,6 +11,10 @@ Tables (prefix drillhole_), made with these columns when missing:
     drillhole_styles   rock, color                              (color: "#RRGGBB")
     drillhole_translation  table_name, field_name, code, description   (e.g. geology / rock / SH / Shale)
 
+plus the drilling records shared with the Drilling Failure Prediction system (drilling fields of the
+collar and the geology, drillhole_run, _bit, _hole_size, _occurrence, _failure and the reference
+tables drillhole_area, _formation, _rig, _measure) - see drilling_schema.py, made by ``prepare`` too.
+
 Tables imported by the user keep their own column names: the hole id may be "BHID",
 the depths "from" / "to", ... (recognised as when reading). A hole is saved in one
 transaction: its collar row and all its survey / geology / assay rows together.
@@ -26,14 +30,14 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from ..i18n import N_, tr, trc
+from ..i18n import N_, every_translation, tr, trc
+from . import drilling_schema as ds
 from .colors import parse_color
 from .drillholes import _AZI, _DIP, _FROM, _HOLE, _MAXDEPTH, _SDEPTH, _TO, _X, _Y, _Z, _find
 
 COLLAR, SURVEY, GEOLOGY, ASSAY = "drillhole_collar", "drillhole_survey", "drillhole_geology", "drillhole_assay"
 # Information about a hole kept in its collar row (all may be empty).
-HOLE_STATES = {1: N_("In work"), 2: N_("Completed with ore hit"), 3: N_("Completed without ore hit"),
-               4: N_("Failed")}       # English: stored in a text state column; tr() where shown
+HOLE_STATES = ds.HOLE_STATES   # 1 In work ... 4 Failed, 5 Planned, 6 Completed; English: tr() where shown
 # drillhole_collar.state is stored as this small number and always shown as the text
 COLLAR_INFO = (("organization", "VARCHAR(100)"), ("drilling_manager", "VARCHAR(100)"),
                ("geology_surveyor", "VARCHAR(100)"), ("start_date", "VARCHAR(10)"), ("end_date", "VARCHAR(10)"),
@@ -42,7 +46,8 @@ STYLES, TRANSLATION = "drillhole_styles", "drillhole_translation"
 HOLE_TABLES = (SURVEY, GEOLOGY, ASSAY)        # the per-hole tables the manager edits, in tab order
 _ROCK = ("rock", "lith", "lithology", "litho", "code")
 _NOTE = ("note", "notes", "comment", "comments", "remarks")
-_NOT_HOLE_TABLES = {STYLES, TRANSLATION, "drillhole_meta"}
+_NOT_HOLE_TABLES = {STYLES, TRANSLATION, "drillhole_meta"} | {t.name for t in ds.REFERENCE_TABLES}
+DRILLING_TABLES = tuple(t.name for t in ds.RECORD_TABLES)   # a hole's drilling records (Drillhole Manager tabs)
 _NUMERIC = ("INT", "REAL", "DOUB", "FLOA", "DEC", "NUM")
 _ROLE_ORDER = ("x", "y", "z", "max_depth", "depth", "azimuth", "dip", "from", "to", "rock", "note")
 
@@ -206,6 +211,7 @@ class DrillholeStore:
             n = self._fill_styles(db)
             if n:
                 notes.append(tr("filled rock / color of {n} {table} rows from the Surpac colours", n=n, table=STYLES))
+            notes += ds.prepare(db)                    # the drilling records + predefined measures and rigs
             for t in self._hole_tables(db):
                 info = self._info(db, t)
                 if info.hole:
@@ -286,7 +292,7 @@ class DrillholeStore:
             collar = dict(zip(ci.columns, rows[0])) if rows else {}
             collar.pop(ci.hole, None)
             tables = {}
-            for t in HOLE_TABLES:
+            for t in HOLE_TABLES + tuple(d for d in DRILLING_TABLES if db.has_table(d)):
                 ti = self._info(db, t)
                 cur = db.con.cursor()
                 try:
@@ -351,19 +357,24 @@ class DrillholeStore:
                                f"WHERE {db.q(ci.hole)} = ?",
                                [self._value(ci, c, data.collar[c]) for c in sets] + [new_id])
                 for t, df in data.tables.items():
-                    ti = self._info(db, t)
-                    db.execute(f"DELETE FROM {db.q(t)} WHERE {db.q(ti.hole)} = ?", (new_id,))
-                    cols = [c for c in df.columns if c in ti.columns and c != ti.hole]
-                    key = [c for c in ti.depth_columns[:1] if c in cols]
-                    if key:
-                        df = df.assign(_k=[_num(v) for v in df[key[0]]]).sort_values("_k", kind="stable")
-                    rows = [[new_id] + [self._value(ti, c, v) for c, v in zip(cols, r)]
-                            for r in df[cols].itertuples(index=False, name=None)]
-                    if rows:
-                        names = ", ".join(db.q(c) for c in [ti.hole] + cols)
-                        db.executemany(f"INSERT INTO {db.q(t)} ({names}) VALUES ({', '.join('?' * (len(cols) + 1))})",
-                                       rows)
+                    self._write_rows(db, self._info(db, t), new_id, df)
         return new_id
+
+    def _write_rows(self, db, ti: TableInfo, hid: str, df: pd.DataFrame) -> int:
+        """Replace the hole's rows in one per-hole table with ``df`` (sorted by depth); inside
+        the caller's transaction. Returns the rows written."""
+        t = ti.name
+        db.execute(f"DELETE FROM {db.q(t)} WHERE {db.q(ti.hole)} = ?", (hid,))
+        cols = [c for c in df.columns if c in ti.columns and c != ti.hole]
+        key = [c for c in ti.depth_columns[:1] if c in cols]
+        if key:
+            df = df.assign(_k=[_num(v) for v in df[key[0]]]).sort_values("_k", kind="stable")
+        rows = [[hid] + [self._value(ti, c, v) for c, v in zip(cols, r)]
+                for r in df[cols].itertuples(index=False, name=None)]
+        if rows:
+            names = ", ".join(db.q(c) for c in [ti.hole] + cols)
+            db.executemany(f"INSERT INTO {db.q(t)} ({names}) VALUES ({', '.join('?' * (len(cols) + 1))})", rows)
+        return len(rows)
 
     @staticmethod
     def _value(info: TableInfo, col: str, v):
@@ -401,16 +412,20 @@ class DrillholeStore:
                            "VALUES ('geology', 'rock', ?, ?)", (rock, _text(description)))
 
     def export_excel(self, path) -> dict[str, int]:
-        """All holes to an Excel workbook with the sheets collar, geology, survey and assay
-        (every column as stored, sorted by hole and depth; header row frozen). Returns the
+        """All holes to an Excel workbook with the sheets collar, geology, survey and assay, plus
+        the drilling records (run, hole_size, bit, occurrence, failure) that have rows (every column
+        as stored, sorted by hole and depth; header row frozen). Returns the
         number of rows per sheet. Raises PermissionError when the file is open in Excel."""
         import openpyxl  # noqa: F401 - the Excel writer pandas uses (imported here so it is bundled)
         from openpyxl.utils import get_column_letter
 
         frames: dict[str, pd.DataFrame] = {}
         with self.target.connect(create=False) as db:
-            for sheet, table in (("collar", COLLAR), ("geology", GEOLOGY), ("survey", SURVEY), ("assay", ASSAY)):
+            extra = tuple((t.short, t.name) for t in ds.RECORD_TABLES)
+            for sheet, table in (("collar", COLLAR), ("geology", GEOLOGY), ("survey", SURVEY), ("assay", ASSAY)) + extra:
                 name = db.table_name(table)
+                if (sheet, table) in extra and (name is None or not db.scalar(f"SELECT COUNT(*) FROM {db.q(name)}")):
+                    continue                           # the drilling sheets only when they have rows
                 if name is None:
                     frames[sheet] = pd.DataFrame()
                     continue
@@ -466,6 +481,74 @@ class DrillholeStore:
                         counts.setdefault(_text(code), 0)
         return [(c, desc.get(c, ""), counts[c]) for c in sorted(counts, key=_natural)]
 
+    # --- drilling records shared with the risk prediction (drilling_schema.py) -----------------
+    def hole_areas(self) -> dict[str, str]:
+        """Hole -> its drilling area ('' when none)."""
+        with self.target.connect(create=False) as db:
+            ci = self._info(db, COLLAR)
+            col = next((c for c in ci.columns if c.lower() == "area_id"), None)
+            if col is None:
+                return {}
+            return {str(h): (str(a) if a is not None else "")
+                    for h, a in db.query(f"SELECT {db.q(ci.hole)}, {db.q(col)} FROM {COLLAR}") if h is not None}
+
+    def reference(self, table: str) -> pd.DataFrame:
+        """All rows of a reference table (drillhole_area, _formation, _rig, _measure)."""
+        with self.target.connect(create=False) as db:
+            df = ds.read_table(db, ds.table(table))
+        key = ds.table(table).key[0]
+        if table == ds.MEASURE.name or not len(df):
+            return df
+        return df.iloc[sorted(range(len(df)), key=lambda i: _natural(df[key].iloc[i]))].reset_index(drop=True)
+
+    def save_reference(self, table: str, df: pd.DataFrame) -> None:
+        with self.target.connect() as db:
+            ds.save_reference(db, ds.table(table), df)
+
+    def default_reference(self, table: str) -> pd.DataFrame:
+        """The predefined rows of a reference table (measures, example rigs; empty for the others)."""
+        t = ds.table(table)
+        return pd.DataFrame(ds.default_reference().get(t.name, []), columns=t.names)
+
+    def choices(self) -> dict[str, dict[str, str]]:
+        """The codes of the columns filled from other tables: area_id, rig_model, formation, and the
+        rock classes of the formation cards (main_rock, second_rock)."""
+        with self.target.connect(create=False) as db:
+            out = {"area_id": {a: a for a in ds.area_ids(db)}}
+            for col, t in (("rig_model", ds.RIG), ("formation", ds.FORMATION)):
+                name = db.table_name(t.name)
+                rows = db.query(f"SELECT {db.q(col)} FROM {db.q(name)}") if name else []
+                out[col] = {str(r[0]): str(r[0]) for r in sorted(rows, key=lambda r: _natural(r[0]))
+                            if r[0] is not None}
+            rocks = ds.rock_classes(db)
+        out["main_rock"] = out["second_rock"] = rocks
+        return out
+
+    def rig(self, model: str | None) -> dict | None:
+        """The specification of a rig model (None when it is not in drillhole_rig)."""
+        if not _text(model):
+            return None
+        df = self.reference(ds.RIG.name)
+        rows = df[df["rig_model"].astype(str) == str(model).strip()]
+        return rows.iloc[0].to_dict() if len(rows) else None
+
+    def measures(self) -> list[dict]:
+        """The measure library (drillhole_measure rows, by expert order)."""
+        df = self.reference(ds.MEASURE.name)
+        if len(df):
+            df = df.assign(_o=pd.to_numeric(df["expert_order"], errors="coerce").fillna(999)).sort_values(
+                ["_o", "code"], kind="stable").drop(columns="_o")
+        return df.to_dict("records")
+
+    def export_drilling_csv(self, folder, areas: list[str] | None = None) -> dict[str, int]:
+        """The drilling history as CSV files (the exchange format of the risk prediction)."""
+        return ds.export_csv(self.target, folder, areas)
+
+    def import_drilling_csv(self, folder, replace_areas: bool = False):
+        """CSV files of a drilling history into the database: (rows per file, issues)."""
+        self.prepare()
+        return ds.import_csv(self.target, folder, replace_areas)
+
     # --- assay fields ------------------------------------------------------------------------
     def assay_fields(self) -> list[str]:
         info = self.info(ASSAY)
@@ -506,10 +589,17 @@ def state_code(value) -> int | None:
     if t is None:
         return None
     n = _num(t)
-    if n is not None and int(n) in HOLE_STATES and n == int(n):
-        return int(n)
+    if n is not None and n == int(n):
+        n = ds.LEGACY_STATES.get(int(n), int(n))          # 6 "Completed" of an earlier version
+        if n in HOLE_STATES:
+            return n
     low = t.lower()
-    return next((k for k, v in HOLE_STATES.items() if low in (v.lower(), tr(v).lower())), None)
+    if low == "completed":
+        return ds.NO_ORE_HIT
+    found = next((k for k, v in HOLE_STATES.items() if low in (v.lower(), tr(v).lower())), None)
+    if found is None:                         # typed in another language (e.g. an Excel template)
+        found = next((k for k, v in HOLE_STATES.items() if low in {x.lower() for x in every_translation(v)}), None)
+    return found
 
 
 def state_text(value) -> str:
@@ -539,10 +629,13 @@ _DATE_ERRORS = {"start_date": N_("Collar: start date must be a date like 2026-03
                 "end_date": N_("Collar: end date must be a date like 2026-03-31")}
 
 
-def check_hole(collar_info: TableInfo, collar: dict, tables: dict[str, tuple[TableInfo, pd.DataFrame]]):
+def check_hole(collar_info: TableInfo, collar: dict, tables: dict[str, tuple[TableInfo, pd.DataFrame]],
+               row_numbers: dict[str, list[int]] | None = None, context: dict | None = None):
     """(errors, warnings) for a hole about to be saved; errors stop the save.
 
-    ``tables``: table -> (its TableInfo, the rows as edited)."""
+    ``tables``: table -> (its TableInfo, the rows as edited). ``row_numbers``: table -> the
+    number shown for each row (e.g. its row in an Excel sheet); else 1, 2, ... ``context``: for
+    the drilling records, e.g. max_rpm of the hole's rig."""
     errors, warnings = [], []
     label = {SURVEY: trc("drillhole", "Survey"), GEOLOGY: tr("Geology"), ASSAY: tr("Assay")}
     for key in ("x", "y", "z"):
@@ -566,14 +659,31 @@ def check_hole(collar_info: TableInfo, collar: dict, tables: dict[str, tuple[Tab
                          states=", ".join(tr(v) for v in HOLE_STATES.values())))
     md_col = collar_info.roles.get("max_depth")
     max_depth = _num(collar.get(md_col)) if md_col else None
-    if max_depth is not None and max_depth <= 0:
+    if max_depth is not None and (max_depth < 0 or max_depth == 0 and state_code(state) not in (ds.PLANNED,
+                                                                                                ds.IN_WORK)):
         errors.append(tr("Collar: the hole length must be more than 0"))
+    drilling = {c.name: collar.get(low[c.name]) for c in ds.COLLAR_ADDED if c.name in low}
+    if drilling:                                  # the drilling fields: ranges and codes
+        _, found = ds.validate(ds.COLLAR, pd.DataFrame([drilling]))
+        for i in found:
+            (errors if i.level == "error" else warnings).append(tr("Collar: {message}", message=i.message))
     for t, (info, df) in tables.items():
+        if t in DRILLING_TABLES or t == GEOLOGY:      # the drilling records (drilling_schema.py)
+            part = df if t != GEOLOGY else df[[c.name for c in ds.GEOLOGY_ADDED if c.name in df.columns]]
+            _, found = ds.validate(ds.table(t), part, {"max_depth": max_depth, **(context or {})})
+            shown = (row_numbers or {}).get(t)
+            for i in found:
+                if shown and i.row is not None and i.row < len(shown):
+                    i.row = shown[i.row] - 1
+                (errors if i.level == "error" else warnings).append(i.text())
+            if t in DRILLING_TABLES:
+                continue
         name = label.get(t, t)
         r = info.roles
+        numbers = (row_numbers or {}).get(t) or list(range(1, len(df) + 1))
         if t == SURVEY:
             seen = set()
-            for i, row in enumerate(df.to_dict("records"), start=1):
+            for i, row in zip(numbers, df.to_dict("records")):
                 d = _num(row.get(r.get("depth")))
                 if d is None or d < 0:
                     errors.append(tr("{name} row {i}: depth must be a number, 0 or more", name=name, i=i))
@@ -595,7 +705,7 @@ def check_hole(collar_info: TableInfo, collar: dict, tables: dict[str, tuple[Tab
         if "from" not in r or "to" not in r:
             continue
         spans = []
-        for i, row in enumerate(df.to_dict("records"), start=1):
+        for i, row in zip(numbers, df.to_dict("records")):
             a, b = _num(row.get(r["from"])), _num(row.get(r["to"]))
             if a is None or b is None:
                 errors.append(tr("{name} row {i}: From and To must be numbers", name=name, i=i))
@@ -617,4 +727,9 @@ def check_hole(collar_info: TableInfo, collar: dict, tables: dict[str, tuple[Tab
             if a2 < b1 - 1e-9:
                 warnings.append(tr("{name}: rows {i1} and {i2} overlap ({a1:g}-{b1:g} and {a2:g}-{b2:g})",
                                     name=name, i1=i1, i2=i2, a1=a1, b1=b1, a2=a2, b2=b2))
+    if any(t in DRILLING_TABLES for t in tables):     # across the hole's drilling records
+        values = {c.name: collar.get(low.get(c.name, c.name)) for c in ds.COLLAR.cols}
+        values["state"] = state_code(state)
+        for i in ds.check_drilling(values, {t: df for t, (_info, df) in tables.items()}):
+            (errors if i.level == "error" else warnings).append(i.text())
     return errors, warnings

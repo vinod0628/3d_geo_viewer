@@ -24,11 +24,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..i18n import N_, tr
+from ..i18n import N_, tr, trn
 from ..scene.layers import (COLORMAPS, DEPLETION_ATTRS, MINED_DISPLAYS, BlockModelLayer, DrillholeLayer, Layer,
                             StringLayer, SurfaceLayer)
 from ..io.survey_store import STATION_LEVELS
-from ..scene.survey import SurveyLayer
+from ..scene.survey import SurveyLayer, design_rows
 from .icons import icon
 from .layer_tree import panel_header
 
@@ -85,6 +85,10 @@ class PropertiesPanel(QWidget):
         self.pit = None                # a pit of the survey layer shown instead of the layer
         # (layer, pit id, **settings): set by the main window so the layers list follows
         self.on_pit_style: Callable | None = None
+        self.design = None             # a designed pit of the survey layer shown instead of the layer
+        self.designs_group = False     # the survey layer's "Designed Pits" group shown instead of the layer
+        self.on_design_style: Callable | None = None
+        self.on_designs_shown: Callable | None = None       # (layer, on): the group switched on / off
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -100,6 +104,8 @@ class PropertiesPanel(QWidget):
     def set_layer(self, layer: Layer | None) -> None:
         self.layer = layer
         self.pit = None
+        self.design = None
+        self.designs_group = False
         body = QWidget()
         v = QVBoxLayout(body)
         v.setContentsMargins(8, 4, 8, 8)
@@ -116,11 +122,25 @@ class PropertiesPanel(QWidget):
                 v.addWidget(extra)
             v.addWidget(self._info_group(layer))
         v.addStretch(1)
+        self._set_body(body)
+
+    def _set_body(self, body: QWidget) -> None:
+        """Show ``body`` in place of the panel's contents. The old contents are deleted later, not now: the
+        panel is rebuilt from its own check boxes' signals (e.g. Visible), and deleting the check box while Qt
+        is still handling its mouse click crashed the app."""
+        old = self.scroll.takeWidget()
         self.scroll.setWidget(body)
+        if old is not None:
+            old.hide()
+            old.deleteLater()
 
     def refresh(self) -> None:
         if self.pit is not None and isinstance(self.layer, SurveyLayer):
             self.set_pit(self.layer, self.pit)
+        elif self.design is not None and isinstance(self.layer, SurveyLayer):
+            self.set_design(self.layer, self.design)
+        elif self.designs_group and isinstance(self.layer, SurveyLayer):
+            self.set_designs(self.layer)
         else:
             self.set_layer(self.layer)
 
@@ -130,7 +150,7 @@ class PropertiesPanel(QWidget):
         if p is None:
             self.set_layer(layer)
             return
-        self.layer, self.pit = layer, pid
+        self.layer, self.pit, self.design, self.designs_group = layer, pid, None, False
         body = QWidget()
         v = QVBoxLayout(body)
         v.setContentsMargins(8, 4, 8, 8)
@@ -138,7 +158,131 @@ class PropertiesPanel(QWidget):
         v.addWidget(self._pit_group(layer, p))
         v.addWidget(self._pit_info_group(layer, p))
         v.addStretch(1)
-        self.scroll.setWidget(body)
+        self._set_body(body)
+
+    def set_design(self, layer: SurveyLayer, did) -> None:
+        """A designed pit: shown or not, its colour, and what it is."""
+        x = layer.data.design(did) if layer is not None and layer.data is not None else None
+        if x is None:
+            self.set_layer(layer)
+            return
+        self.layer, self.pit, self.design, self.designs_group = layer, None, did, False
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(8, 4, 8, 8)
+        v.setSpacing(6)
+        g, f = self._form(tr("Designed pit"))
+        name = QLabel(x.name)
+        name.setStyleSheet("font-weight: 600;")
+        name.setWordWrap(True)
+        f.addRow(tr("Name"), name)
+        st = layer.design_style(did)
+        vis = QCheckBox()
+        vis.setChecked(st["visible"])
+        vis.setToolTip(tr("Show or hide this designed pit"))
+        vis.toggled.connect(lambda on: self._design_set(layer, did, visible=on))
+        f.addRow(tr("Visible"), vis)
+        if st["visible"] and not layer.show_designs:
+            note = QLabel(tr("Not drawn: Designed Pits is switched off"))
+            note.setStyleSheet("color: #e0a030;")
+            note.setWordWrap(True)
+            f.addRow(note)
+        row = QHBoxLayout()
+        colour = ColorButton(layer.design_color(did), lambda rgb: self._design_set(layer, did, color=rgb))
+        colour.setToolTip(tr("Colour of the designed drive and its centre line"))
+        row.addWidget(colour, 1)
+        if st["color"] is not None:
+            reset = QToolButton()
+            reset.setIcon(icon("restore"))
+            reset.setToolTip(tr("Back to the default colour"))
+            reset.clicked.connect(lambda: self._design_set(layer, did, color=None))
+            row.addWidget(reset)
+        f.addRow(tr("Colour"), row)
+        cl = QCheckBox()
+        cl.setChecked(st["centerline"])
+        cl.setToolTip(tr("The centre line of this designed pit"))
+        cl.toggled.connect(lambda on: self._design_set(layer, did, centerline=on))
+        f.addRow(tr("Centre line"), cl)
+        v.addWidget(g)
+        g2, f2 = self._form(tr("Information"))
+        for k, val in design_rows(layer, x)[1:]:
+            lbl = QLabel(str(val))
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: #c4cad1;")
+            key = QLabel(k)
+            key.setStyleSheet("color: #8a939d;")
+            f2.addRow(key, lbl)
+        v.addWidget(g2)
+        v.addStretch(1)
+        self._set_body(body)
+
+    def set_designs(self, layer: SurveyLayer) -> None:
+        """The "Designed Pits" group: all designed pits shown or not, their centre lines, and totals."""
+        if layer is None or layer.data is None or not layer.data.designs:
+            self.set_layer(layer)
+            return
+        self.layer, self.pit, self.design, self.designs_group = layer, None, None, True
+        ds = layer.data.designs
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(8, 4, 8, 8)
+        v.setSpacing(6)
+        g, f = self._form(tr("Designed Pits"))
+        vis = QCheckBox()
+        vis.setChecked(layer.show_designs)
+        vis.setToolTip(tr("Show or hide all designed pits (the surveyed pits are not affected)"))
+        vis.toggled.connect(lambda on: self._designs_shown(layer, on))
+        f.addRow(tr("Visible"), vis)
+        lines = [layer.design_style(x.id)["centerline"] for x in ds]
+        cl = QCheckBox()
+        cl.setTristate(False)
+        cl.setChecked(all(lines))
+        cl.setToolTip(tr("Centre lines of all designed pits (each one can also be set on its own)"))
+        cl.toggled.connect(lambda on: self._designs_centerline(layer, on))
+        f.addRow(tr("Centre lines"), cl)
+        if any(lines) and not all(lines):
+            note = QLabel(tr("Some designed pits have their centre line switched off."))
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #8a939d;")
+            f.addRow(note)
+        hint = QLabel(tr("Select a designed pit below this group for its colour and details."))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a939d;")
+        f.addRow(hint)
+        v.addWidget(g)
+        g2, f2 = self._form(tr("Information"))
+        rows = [(tr("Designed pits"), f"{len(ds):,}"), (tr("Total length"), f"{sum(x.length for x in ds):,.1f} m"),
+                (tr("Total volume"), tr("{v:,.0f} m³", v=sum(layer.design_volume(x.id) for x in ds)))]
+        for k, val in rows:
+            lbl = QLabel(str(val))
+            lbl.setStyleSheet("color: #c4cad1;")
+            key = QLabel(k)
+            key.setStyleSheet("color: #8a939d;")
+            f2.addRow(key, lbl)
+        v.addWidget(g2)
+        v.addStretch(1)
+        self._set_body(body)
+
+    def _designs_shown(self, layer, on: bool) -> None:
+        if self.on_designs_shown is not None:
+            self.on_designs_shown(layer, on)
+        else:
+            layer.set_show_designs(on)
+            self.on_changed()
+        self.refresh()
+
+    def _designs_centerline(self, layer, on: bool) -> None:
+        layer.set_designs_centerline(on)
+        self.on_changed()
+        self.refresh()
+
+    def _design_set(self, layer, did, **kw):
+        if self.on_design_style is not None:
+            self.on_design_style(layer, did, **kw)
+        else:
+            layer.set_design_style(did, **kw)
+            self.on_changed()
+        self.refresh()
 
     def _pit_set(self, layer, pid, **kw):
         if self.on_pit_style is not None:
@@ -220,7 +364,13 @@ class PropertiesPanel(QWidget):
         rows = [(tr("Code"), p.code), (tr("Starts at"), p.start_station or "-"),
                 (tr("Length (plan)"), f"{layer.pit_length(p.id):,.1f} m"), (tr("Stations"), f"{n_st:,}"),
                 (tr("Profile"), profile),
+                (tr("Volume"), tr("{v:,.0f} m³", v=layer.pit_volume(p.id))),
                 (tr("Branches"), f"{len(d.children(p.id)):,}")]
+        if d.children(p.id):
+            n_all = len(layer.pit_family(p.id)) - 1
+            rows.append((tr("Volume with branches"),
+                         trn("{v:,.0f} m³ ({n} branch)", "{v:,.0f} m³ ({n} branches)", n_all,
+                             v=layer.pit_volume(p.id, branches=True))))
         for k, val in rows:
             lbl = QLabel(str(val))
             lbl.setWordWrap(True)
@@ -282,6 +432,15 @@ class PropertiesPanel(QWidget):
             c.setCurrentIndex(values.index(current))
         handler = self._changed(fn, rebuild_panel)
         c.currentIndexChanged.connect(lambda i: handler(values[i]) if 0 <= i < len(values) else None)
+        return c
+
+    def _cmap_combo(self, current: str, fn) -> "ColormapCombo":
+        """The colour maps shown as their gradients (the name is the tooltip)."""
+        from .colormap_combo import ColormapCombo
+
+        c = ColormapCombo(COLORMAPS, current)
+        handler = self._changed(fn, False)
+        c.currentIndexChanged.connect(lambda _i: handler(c.currentData()) if c.currentData() else None)
         return c
 
     # --- groups ----------------------------------------------------------------
@@ -348,6 +507,20 @@ class PropertiesPanel(QWidget):
         labels = self._check(layer.show_labels, lambda v: (setattr(layer, "show_labels", v), layer.rebuild()))
         labels.setToolTip(tr("Names of the survey stations"))
         f.addRow(tr("Station names"), labels)
+        geo = self._check(layer.show_geology, lambda v: (setattr(layer, "show_geology", v), layer.rebuild()))
+        geo.setToolTip(tr("The rocks mapped in the pits, on the walls and the back (Pit geology, Ctrl+J)"))
+        f.addRow(tr("Mapped rocks"), geo)
+        st = self._check(layer.show_structures, lambda v: (setattr(layer, "show_structures", v), layer.rebuild()))
+        st.setToolTip(tr("The structures mapped in the pits: discs tilted to their dip direction and dip"))
+        f.addRow(tr("Structures"), st)
+        size = self._spin(float(layer.structure_size), 0.1, 20.0, 0.25,
+                          lambda v: (setattr(layer, "structure_size", float(v)), layer.rebuild()), 2)
+        size.setSuffix(" m")
+        size.setToolTip(tr("Radius of a structure's disc"))
+        f.addRow(tr("Disc radius"), size)
+        sm = self._check(layer.show_samples, lambda v: (setattr(layer, "show_samples", v), layer.rebuild()))
+        sm.setToolTip(tr("The samples taken in the pits: narrow bands at their height on the wall"))
+        f.addRow(tr("Pit samples"), sm)
         hint = QLabel(tr("Select a pit under this layer for its colour, visibility, centre lines and stations."))
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8a939d;")
@@ -369,8 +542,8 @@ class PropertiesPanel(QWidget):
         f.addRow(tr("Colour by"), self._combo(names, layer.color_by or None, set_attr, True))
 
         if layer.color_by and not bm.is_categorical(layer.color_by):
-            f.addRow(tr("Colour map"), self._combo(COLORMAPS, layer.cmap,
-                                               lambda t: (setattr(layer, "cmap", t), layer.rebuild())))
+            f.addRow(tr("Colour map"), self._cmap_combo(layer.cmap,
+                                                    lambda t: (setattr(layer, "cmap", t), layer.rebuild())))
             rng = layer.value_range() or (0.0, 1.0)
             span = max(rng[1] - rng[0], 1e-9)
             lo = layer.value_min if layer.value_min is not None else rng[0]
@@ -461,6 +634,16 @@ class PropertiesPanel(QWidget):
     def _drillhole_group(self, layer: DrillholeLayer) -> QGroupBox:
         g, f = self._form(tr("Drillholes"))
         db = layer.data
+        counts = layer.all_data.area_counts() if layer.all_data is not None else {}
+        if counts:                                   # drilling areas (e.g. the history of distant areas)
+            items = [(tr("Automatic (areas being drilled)"), layer.AREA_AUTO),
+                     (tr("All areas ({n:,} holes)", n=len(layer.all_data.collars)), layer.AREA_ALL)]
+            items += [(tr("{area} ({n:,} holes)", area=a, n=n), a) for a, n in counts.items()]
+            box = self._combo(items, layer.area if layer.area in counts or layer.area == layer.AREA_ALL
+                              else layer.AREA_AUTO, layer.set_area, True)
+            box.setToolTip(tr("The drilling area whose holes are shown. Automatic: the areas with holes in work or "
+                              "planned (every hole when there are none)."))
+            f.addRow(tr("Area"), box)
         tables = list(db.intervals)
         if tables:
             def set_table(t):

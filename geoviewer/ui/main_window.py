@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 import vtk
@@ -28,7 +29,8 @@ from ..io import database
 from ..scene.layers import Layer
 from ..scene.loaders import FILE_FILTER, load_paths
 from ..scene.scene import VIEW_3D, VIEW_XY, VIEW_XZ, VIEW_YZ, Scene
-from ..workspace import Workspace, _from_text, _key, _to_text, changed_layers, layer_spec, load_spec, reload_layers
+from ..workspace import (WORKSPACE_FILE, Workspace, _from_text, _key, _to_text, changed_layers, layer_spec, load_spec,
+                         reload_layers, split_block_csvs)
 from .floating_toolbar import FloatingButton, FloatingToolbar, OverlayController
 from .icons import app_icon, icon, text_icon
 from .identify import IdentifyTool
@@ -39,12 +41,14 @@ from .section_tool import SectionTool
 from .mined_shape_tool import MinedShapeTool
 from .drillhole_manager import DrillholeManager
 from .survey_manager import SurveyManager
+from .window_parking import WindowParking
 from .reserve_window import ReserveManager
 from .properties_panel import PropertiesPanel
 from .settings_dialog import AppSettings, SettingsDialog
 
 APP_NAME = "GeoViewer"
 AUTOSAVE_POLL_MS = 2000      # retry of a save asked while files still load
+STATUS_WARNING_MS = 30000    # how long a status bar warning stays
 log = logging.getLogger(__name__)
 
 
@@ -102,6 +106,8 @@ class MainWindow(QMainWindow):
         self._generation = 0              # bumped when the scene is cleared; stale results are dropped
         self._refresh_running = False
         self._open_after_load: list[str] = []   # files to open once the workspace being opened is shown
+        self._import_queue: list[Path] = []     # block model CSVs waiting for their import (.gvbm)
+        self._importing = False
         self._autosave_failed = False
 
         # --- layout -----------------------------------------------------------
@@ -140,6 +146,12 @@ class MainWindow(QMainWindow):
         self.status_refresh = QLabel("")
         self.status_xyz = QLabel("")
         self.status_xyz.setMinimumWidth(320)
+        self.status_warn = QLabel("")           # e.g. a -w folder that is not a workspace
+        self.status_warn.setStyleSheet("color: #f0a030;")
+        self.status_warn.hide()
+        self._warn_timer = QTimer(self, singleShot=True, interval=STATUS_WARNING_MS)
+        self._warn_timer.timeout.connect(self.clear_status_warning)
+        self.statusBar().addWidget(self.status_warn)
         self.statusBar().addWidget(self.status_msg, 1)
         self.status_db = QLabel("")             # which database, connected or not
         self.statusBar().addPermanentWidget(self.status_db)
@@ -176,6 +188,9 @@ class MainWindow(QMainWindow):
         self.reserve = ReserveManager(self)
         self.drillhole_manager: DrillholeManager | None = None
         self.survey_manager: SurveyManager | None = None
+        self.pit_geology = None                  # the Pit Geology window (ui/pit_geology.py)
+        # tool windows hide (keeping what they show) instead of minimising; their toolbar button brings them back
+        self.parking = WindowParking(self)
         self.db_error = ""                       # why the project database cannot be used ("" = connected)
         self._db_warned = ""                     # the error last shown in a warning (not repeated by Refresh)
 
@@ -193,7 +208,20 @@ class MainWindow(QMainWindow):
         self.layer_tree.pit_visibility_changed.connect(lambda layer, pid, on: self.set_pit_style(layer, pid,
                                                                                                 visible=on))
         self.layer_tree.pit_zoom_requested.connect(self.zoom_to_pit)
+        self.layer_tree.pit_geology_requested.connect(lambda _layer, pid: self.open_pit_geology(pid))
         self.props.on_pit_style = self.set_pit_style
+        self.layer_tree.design_selected.connect(self.props.set_design)
+        self.layer_tree.design_selected.connect(lambda layer, _did: self._on_layer_selected(layer))
+        self.layer_tree.design_visibility_changed.connect(
+            lambda layer, did, on: self.set_design_style(layer, did, visible=on))
+        self.layer_tree.designs_visibility_changed.connect(self.set_designs_shown)
+        self.layer_tree.design_zoom_requested.connect(self.zoom_to_design)
+        self.layer_tree.design_rename_requested.connect(self.rename_design)
+        self.layer_tree.design_delete_requested.connect(self.delete_design)
+        self.props.on_design_style = self.set_design_style
+        self.layer_tree.designs_selected.connect(self.props.set_designs)
+        self.layer_tree.designs_selected.connect(self._on_layer_selected)
+        self.props.on_designs_shown = self.set_designs_shown
 
         # --- actions, toolbar, shortcuts -----------------------------------------
         self._build_actions()
@@ -311,6 +339,7 @@ class MainWindow(QMainWindow):
         self.a_identify = A(tr("Identify"), tr("Identify: click an object to see its information"),
                             None, icon("information-outline"), "Ctrl+I", checkable=True)
         self.a_identify.toggled.connect(lambda on: self._tool_toggled(self.identify, on))
+        self.a_identify.toggled.connect(lambda on: on and self.parking.restore("identify"))
         self.a_measure = A(tr("Measure"), tr("Measure: click two points for distance, bearing and inclination"),
                            None, icon("ruler"), "Ctrl+M", checkable=True)
         self.a_measure.toggled.connect(lambda on: self._tool_toggled(self.measure, on))
@@ -319,6 +348,7 @@ class MainWindow(QMainWindow):
                            None, icon("box-cutter"), "Ctrl+K",
                            checkable=True, enabled=False)
         self.a_section.toggled.connect(lambda on: self._tool_toggled(self.section, on))
+        self.a_section.toggled.connect(lambda on: on and self.parking.restore("section"))
         self.a_mined = A(tr("Mined outline"), tr("Mined outline (2D views): click the corners of the mined area, "
                                                  "right-click or Enter to close it, then enter the date and From / To"),
                          None, icon("vector-polygon"), "Ctrl+L", checkable=True, enabled=False)
@@ -328,10 +358,19 @@ class MainWindow(QMainWindow):
         self.a_drillholes = A(tr("Drillholes"), tr("Drillhole Manager: add / remove holes, edit collar, survey, "
                                                    "geology and assay, rock colours"), self.open_drillhole_manager,
                               icon("database-edit-outline"), "Ctrl+D")
-        self.a_survey = A(tr("Survey"), tr("Survey: main pits and branches, traverse setups (total station or "
-                                           "compass), closure check; the drives are drawn from it"),
+        self.a_blocks = A(tr("Block models"), tr("Block Model Manager: new block model inside an ore solid, Surpac "
+                                                 "ASCII import, attributes, grade estimation (kriging, inverse "
+                                                 "distance) and its validation"),
+                          self.open_block_manager, icon("cube-outline"), "Ctrl+B")
+        self.a_survey = A(tr("Pit Manager"), tr("Pit Manager: main pits and branches, traverse setups (total "
+                                                "station or compass), closure check, designed pits; the drives are "
+                                                "drawn from it"),
                           self.open_survey_manager,
                           icon("map-marker-path"), "Ctrl+U")
+        self.a_pit_geology = A(tr("Pit geology"), tr("Pit Geology: the rocks, structures (dip direction / dip) and "
+                                                     "samples mapped in the pits, by chainage from the pit's start; "
+                                                     "the wall sketch"),
+                               lambda: self.open_pit_geology(), icon("layers-outline"), "Ctrl+J")
 
         self.a_fullscreen = A(tr("Full screen"), tr("Full screen view (Esc to exit)"), self.toggle_fullscreen,
                               icon("fullscreen"), "F11", True)
@@ -354,7 +393,7 @@ class MainWindow(QMainWindow):
         for a in (self.a_identify, self.a_measure, self.a_section):
             t.add_action(a)
         t.add_separator()
-        for a in (self.a_drillholes, self.a_survey, self.a_reserve, self.a_mined):
+        for a in (self.a_drillholes, self.a_blocks, self.a_survey, self.a_pit_geology, self.a_reserve, self.a_mined):
             t.add_action(a)
         t.add_separator()
         t.add_action(self.a_fullscreen)
@@ -644,6 +683,7 @@ class MainWindow(QMainWindow):
             self.section_dialog = SectionDialog(self, self.scene)
             self.section_dialog.set_background(self.app_settings.background_rgb)
             self.section_dialog.closed.connect(self._section_closed)
+            self.parking.watch(self.section_dialog, "section")
         self.section_dialog.export_legend = self._section_legend
         self.section_dialog.show_section(line)
 
@@ -670,6 +710,7 @@ class MainWindow(QMainWindow):
             return
         if self.hole_dialog is None:
             self.hole_dialog = DrillholeLogDialog(self)
+            self.parking.watch(self.hole_dialog, "identify")
         self.hole_dialog.workspace_folder = str(self.workspace.folder) if self.workspace else ""
         self.hole_dialog.show_hole(log, res.extra.get("depth"))
 
@@ -803,6 +844,12 @@ class MainWindow(QMainWindow):
             return
         if self.workspace is None and not self.quiet_errors and not self._adopt_workspace(paths):
             return  # the folder's saved workspace is being opened; the files follow it
+        others, blocks = split_block_csvs([Path(p) for p in paths])
+        if blocks:                   # block model CSVs are imported into .gvbm, never shown as CSV
+            self.import_block_csvs(blocks)
+        paths = [str(p) for p in others]
+        if not paths:
+            return
         names = ", ".join(Path(p).name for p in paths[:3]) + (" ..." if len(paths) > 3 else "")
         self.status_msg.setText(tr("Loading {names}", names=names))
         self._start_job("files", lambda: load_paths(paths))
@@ -900,6 +947,7 @@ class MainWindow(QMainWindow):
         if not p.is_dir():
             self._report_errors([tr("Workspace folder not found:\n{path}", path=p)], tr("Open workspace"))
             return False
+        self.clear_status_warning()
         self.clear_all()
         ws = Workspace(p)
         self._set_workspace(ws)
@@ -911,6 +959,7 @@ class MainWindow(QMainWindow):
         self._autosave(force=True)
         self._autosave_timer.stop()
         self._open_after_load = []
+        self._import_queue = []
         self._generation += 1
         self.identify.clear()
         self.measure.clear()
@@ -922,6 +971,12 @@ class MainWindow(QMainWindow):
         if self.survey_manager is not None:
             self.survey_manager.close()
             self.survey_manager = None
+        if self.pit_geology is not None:
+            self.pit_geology.close()
+            self.pit_geology = None
+        if getattr(self, "block_manager", None) is not None:
+            self.block_manager.close()             # asks to save unsaved block model changes
+            self.block_manager = None
         if getattr(self, "map_export", None) is not None:
             self.map_export.close()
         if self.hole_dialog is not None:
@@ -963,6 +1018,7 @@ class MainWindow(QMainWindow):
                           tr("Some workspace layers could not be opened"))
         if ws is not None:
             self._set_database_state(ws.database_error)
+        self._take_block_csvs(ws)
         queued, self._open_after_load = self._open_after_load, []
         shown = {_key(p) for lay in self.scene.layers for p in lay.inputs}
         queued = [p for p in queued if _key(Path(p)) not in shown]
@@ -1003,6 +1059,56 @@ class MainWindow(QMainWindow):
         self.status_msg.setText(tr("Workspace saved: {path}", path=path))
         return True
 
+    def handle_open_request(self, workspace: str | None, files: list[str]) -> None:
+        """A later ``GeoViewer -w FOLDER [files]`` handed its workspace to this window: come to
+        the front, close the current workspace and open that one (files are added after it).
+        While a modal dialog is open the request waits until it is closed."""
+        self.bring_to_front()
+        if QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(500, lambda: self.handle_open_request(workspace, files))
+            return
+        if workspace and self.open_command_line_workspace(workspace):
+            if files:
+                self._open_after_load = list(files)
+        elif files:
+            self.open_paths(files)
+
+    def open_command_line_workspace(self, folder: str | Path) -> bool:
+        """``-w FOLDER``: open it only when it is a GeoViewer workspace folder (it holds
+        geoviewer_workspace.json, or FOLDER names that file). Otherwise nothing changes (a running
+        app keeps its workspace) and a warning shows in the status bar - no message box."""
+        p = Path(folder)
+        if p.is_file() and p.name.lower() == WORKSPACE_FILE:
+            p = p.parent
+        if not p.exists():
+            warning = tr("Workspace not found: {path}", path=p)
+        elif not (p / WORKSPACE_FILE).is_file():
+            warning = tr("Not a workspace folder (no {file}): {path}", file=WORKSPACE_FILE, path=p)
+        else:
+            return self.open_workspace(p, confirm=False)
+        self.load_errors.append(warning)            # the smoke test still fails on it
+        log.warning("%s", warning)
+        self.show_status_warning(warning)
+        return False
+
+    def show_status_warning(self, text: str) -> None:
+        self.status_warn.setText("⚠ " + text)
+        self.status_warn.setToolTip(text)
+        self.status_warn.show()
+        self._warn_timer.start()
+
+    def clear_status_warning(self) -> None:
+        self._warn_timer.stop()
+        self.status_warn.clear()
+        self.status_warn.hide()
+
+    def bring_to_front(self) -> None:
+        if self.isMinimized():
+            self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def restore_last_workspace(self) -> bool:
         if not self.app_settings.restore_last_workspace:
             return False
@@ -1028,8 +1134,8 @@ class MainWindow(QMainWindow):
         def work():
             from ..scene.production import production_signature
 
-            if ws is not None and ws.database_error:
-                ws.init_database()                      # try the database again (server back, ...)
+            if ws is not None and (ws.database_error or not ws.database_ready):
+                ws.init_database()      # try again (server back, ...) / first time (folder adopted for files)
             prod_sig = (production_signature(database.project_target(ws.folder))
                         if ws is not None and not ws.database_error else None)
             rep = changed_layers(layers)
@@ -1114,6 +1220,8 @@ class MainWindow(QMainWindow):
                                     else text + tr("; production records updated"))
         if waiting and job["manual"]:
             QTimer.singleShot(2000, lambda: self.refresh(manual=False))
+        if ws is self.workspace:
+            self._take_block_csvs(ws)
         self._schedule_autosave()
 
     # --- drillhole manager -------------------------------------------------------------
@@ -1152,6 +1260,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("Drillhole Manager"),
                                     tr("Open a workspace first: the drillholes are kept in its project database."))
             return
+        if self.drillhole_manager is not None and self.parking.restore("drillholes"):
+            return
         dlg = self.drillhole_manager
         if dlg is not None and dlg.isVisible():
             dlg.raise_()
@@ -1165,7 +1275,120 @@ class MainWindow(QMainWindow):
             dlg.deleteLater()
             return
         self.drillhole_manager = dlg
+        self.parking.watch(dlg, "drillholes")
         dlg.show()
+
+    def open_block_manager(self) -> None:
+        """The Block Model Manager for the block models (.gvbm) of the open workspace."""
+        from .. import licensing
+
+        if not self._licensed_for(licensing.FEAT_DATABASE, tr("Block Model Manager")):
+            return
+        if self.workspace is None:
+            QMessageBox.information(self, tr("Block Model Manager"),
+                                    tr("Open a workspace first: its block models are kept in its folder."))
+            return
+        dlg = getattr(self, "block_manager", None)
+        if dlg is not None and self.parking.restore("blocks"):
+            return
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        from .block_manager import BlockModelManager
+
+        if dlg is not None:
+            dlg.deleteLater()
+        dlg = self.block_manager = BlockModelManager(self, self)
+        dlg.saved.connect(self._block_model_saved)
+        self.parking.watch(dlg, "blocks")
+        dlg.show()
+
+    def _block_model_saved(self, path) -> None:
+        """A block model file was written by the manager: show it (new) or read it again."""
+        path = Path(path)
+        shown = any(_key(p) == _key(path) for lay in self.scene.layers for p in lay.inputs)
+        ws = self.workspace
+        inside = ws is not None and _key(path).startswith(_key(ws.folder) + os.sep)
+        if shown or (inside and _key(path) not in ws.known):
+            # Refresh reloads the changed layer / adds the new file (a file just written counts as
+            # "still being written" and is picked up by the follow-up refresh a moment later)
+            if not hasattr(self, "_dh_timer"):
+                self._dh_timer = QTimer(self)
+                self._dh_timer.setSingleShot(True)
+                self._dh_timer.timeout.connect(self._reload_drillholes)
+            self._dh_timer.start(300)
+            return
+        if ws is not None:
+            ws.known.add(_key(path))
+        self.open_paths([str(path)])
+
+    # --- block model CSVs: imported into GeoViewer block models (.gvbm) ------------------------
+    def _take_block_csvs(self, ws: Workspace | None) -> None:
+        if ws is not None and ws.block_csvs:
+            found, ws.block_csvs = ws.block_csvs, []
+            self.import_block_csvs(found)
+
+    def import_block_csvs(self, paths: list[Path]) -> None:
+        """Block model CSVs are never shown as they are: each is imported into a GeoViewer
+        block model (.gvbm) in the Block Model Manager, one after the other, and then offered
+        for deletion. The .gvbm then shows as the layer."""
+        queue = self._import_queue
+        if self.workspace is not None:            # Refresh does not offer them again
+            self.workspace.known |= {_key(Path(p)) for p in paths}
+        for p in map(Path, paths):
+            if _key(p) not in {_key(q) for q in queue}:
+                queue.append(p)
+        if self.quiet_errors:                     # smoke test / scripted: no dialogs, CSVs not shown
+            for p in queue:
+                log.info("block model CSV not imported (no dialogs): %s", p)
+            queue.clear()
+            return
+        if queue and not self._importing:
+            QTimer.singleShot(0, self._next_block_import)
+
+    def _next_block_import(self) -> None:
+        queue = self._import_queue
+        if self._importing or not queue:
+            return
+        if QApplication.activeModalWidget() is not None:      # e.g. an error message still open
+            QTimer.singleShot(300, self._next_block_import)
+            return
+        path = queue.pop(0)
+        self._importing = True
+        try:
+            if path.exists() and not self._import_block_csv(path):
+                self.show_status_warning(tr("{name} not opened: a block model CSV opens once it is imported as a "
+                                            "GeoViewer block model (.gvbm)", name=path.name))
+        finally:
+            self._importing = False
+        if queue:
+            QTimer.singleShot(0, self._next_block_import)
+
+    def _import_block_csv(self, path: Path) -> bool:
+        from .. import licensing
+        from .block_manager import ImportAsciiDialog, offer_to_remove_source
+
+        self.status_msg.setText(tr("{name} is a block model CSV: import it as a GeoViewer block model (.gvbm)",
+                                   name=path.name))
+        st = licensing.current()
+        if self.workspace is not None and st.ok and st.license.has(licensing.FEAT_DATABASE):
+            self.open_block_manager()                         # the import runs in the manager
+            mgr = getattr(self, "block_manager", None)
+            if mgr is not None and mgr.isVisible():
+                mgr.raise_()
+                return mgr.import_ascii(path)
+        # no Block Model Manager here (license, no workspace): the import dialog alone
+        try:
+            dlg = ImportAsciiDialog(path, self.workspace.folder if self.workspace else None, self)
+        except Exception as e:  # noqa: BLE001 - not readable as a block model export
+            self._report_errors([f"{path.name}: {e}"], tr("Import Surpac block model (ASCII)"))
+            return False
+        if not (dlg.exec() and dlg.result_model is not None):
+            return False
+        self._block_model_saved(dlg.out_path)
+        offer_to_remove_source(self, path, dlg.out_path)
+        return True
 
     def open_map_export(self) -> None:
         """The export window for the current view (2D or 3D): a page saved as PNG."""
@@ -1182,18 +1405,21 @@ class MainWindow(QMainWindow):
         dlg = getattr(self, "map_export", None)
         if dlg is None:
             dlg = self.map_export = MapExportDialog(self)
+            self.parking.watch(dlg, "map_export")
         dlg.start()
 
     def open_survey_manager(self) -> None:
         """The Survey Manager for the project database of the open workspace."""
         from .. import licensing
 
-        if not self._licensed_for(licensing.FEAT_DATABASE, tr("Survey")):
+        if not self._licensed_for(licensing.FEAT_DATABASE, tr("Pit Manager")):
             return
         if self.workspace is None:
-            QMessageBox.information(self, tr("Survey"),
+            QMessageBox.information(self, tr("Pit Manager"),
                                     tr("Open a workspace first: the survey is kept in its project database."))
             return
+        if self.survey_manager is not None and self.parking.restore("survey"):
+            return                                  # as it was left (with the route designer, if open)
         dlg = self.survey_manager
         if dlg is not None and dlg.isVisible():
             dlg.raise_()
@@ -1203,10 +1429,46 @@ class MainWindow(QMainWindow):
 
         dlg = SurveyManager(SurveyStore(database.project_target(self.workspace.folder)), self)
         dlg.changed.connect(self._drillholes_changed)
+        dlg.changed.connect(lambda: self.pit_geology is not None and self.pit_geology.reload())
+        dlg.geology_requested.connect(self.open_pit_geology)
         if not dlg.start():
             dlg.deleteLater()
             return
         self.survey_manager = dlg
+        self.parking.watch(dlg, "survey")
+        dlg.show()
+
+    def open_pit_geology(self, pid=None) -> None:
+        """The Pit Geology window for the project database of the open workspace (``pid``: show that pit)."""
+        from .. import licensing
+
+        if not self._licensed_for(licensing.FEAT_DATABASE, tr("Pit Geology")):
+            return
+        if self.workspace is None:
+            QMessageBox.information(self, tr("Pit Geology"),
+                                    tr("Open a workspace first: the pits are kept in its project database."))
+            return
+        dlg = self.pit_geology
+        if dlg is not None:
+            if not self.parking.restore("pit_geology") and not dlg.isVisible():
+                if not dlg.start(pid):                  # closed before: read the pits again
+                    return
+                dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            if pid is not None:
+                dlg.select_pit(pid)
+            return
+        from .pit_geology import PitGeologyWindow
+
+        dlg = PitGeologyWindow(database.project_target(self.workspace.folder), self,
+                               workspace_folder=str(self.workspace.folder))
+        dlg.changed.connect(self._drillholes_changed)
+        if not dlg.start(pid):
+            dlg.deleteLater()
+            return
+        self.pit_geology = dlg
+        self.parking.watch(dlg, "pit_geology")
         dlg.show()
 
     def _drillholes_changed(self) -> None:
@@ -1331,7 +1593,7 @@ class MainWindow(QMainWindow):
         self.db_error = error
         ok = not error
         cfg = self.app_settings.database
-        for a in (self.a_drillholes, self.a_survey, self.a_reserve):
+        for a in (self.a_drillholes, self.a_survey, self.a_pit_geology, self.a_reserve):
             a.setEnabled(ok)
         self.a_mined.setEnabled(ok and self.scene.view != VIEW_3D)
         if not ok:
@@ -1345,6 +1607,9 @@ class MainWindow(QMainWindow):
             if self.survey_manager is not None:
                 self.survey_manager.close()
                 self.survey_manager = None
+            if self.pit_geology is not None:
+                self.pit_geology.close()
+                self.pit_geology = None
         name = "MySQL " + cfg.database if cfg.is_mysql else "SQLite"
         self.status_db.setText(f"● {name}" if ok else "● " + tr("{name}: not connected", name=name))
         self.status_db.setStyleSheet(f"color: {'#5fd38d' if ok else '#ff6b6b'};")
@@ -1423,6 +1688,18 @@ class MainWindow(QMainWindow):
         self.props.refresh()
         self._schedule_autosave()
 
+    def show_in_view(self, lo_world, hi_world, margin: float = 0.25) -> None:
+        """Bring the main window forward and frame the box lo-hi (world coordinates) with some room around."""
+        import numpy as np
+
+        lo, hi = np.asarray(self.scene.to_local(lo_world), float), np.asarray(self.scene.to_local(hi_world), float)
+        pad = margin * max(float(np.max(hi - lo)), 20.0)
+        lo, hi = lo - pad, hi + pad
+        self.plotter.reset_camera(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+        self.scene.render()
+        self.raise_()
+        self.activateWindow()
+
     def zoom_to_layer(self, layer: Layer | None):
         if layer is None:
             return
@@ -1441,6 +1718,77 @@ class MainWindow(QMainWindow):
         lo, hi = self.scene.to_local(b[0]), self.scene.to_local(b[1])
         self.plotter.reset_camera(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
         self.scene.render()
+
+    def zoom_to_design(self, layer, did) -> None:
+        """Zoom to a designed pit (None: to all of them)."""
+        b = layer.design_bounds(did) if hasattr(layer, "design_bounds") else None
+        if b is None:
+            return
+        lo, hi = self.scene.to_local(b[0]), self.scene.to_local(b[1])
+        self.plotter.reset_camera(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+        self.scene.render()
+
+    def set_design_style(self, layer, did, **kw) -> None:
+        """A designed pit shown / hidden or given a colour (layers list or properties)."""
+        layer.set_design_style(did, **kw)
+        self.layer_tree.update_pits(layer)
+        if self.props.layer is layer and "visible" in kw:
+            self.props.refresh()
+        self._after_property_change()
+
+    def set_designs_shown(self, layer, on: bool) -> None:
+        """The "Designed Pits" group switched on / off."""
+        layer.set_show_designs(on)
+        self.layer_tree.update_pits(layer)
+        if self.props.layer is layer and (self.props.designs_group or self.props.design is not None):
+            self.props.refresh()
+        self._after_property_change()
+
+    def _design_store(self, layer):
+        from ..io.survey_store import SurveyStore
+
+        target = getattr(layer, "db_target", None)
+        if target is None and self.workspace is not None:
+            target = database.project_target(self.workspace.folder)
+        return SurveyStore(target) if target is not None else None
+
+    def rename_design(self, layer, did) -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        x = layer.data.design(did) if layer.data is not None else None
+        store = self._design_store(layer)
+        if x is None or store is None:
+            return
+        text, ok = QInputDialog.getText(self, tr("Rename designed pit"), tr("Name:"), text=x.name)
+        if not ok or not text.strip() or text.strip() == x.name:
+            return
+        try:
+            store.rename_design(did, text)
+        except Exception as e:  # noqa: BLE001 - a name in use, the database not reachable
+            QMessageBox.warning(self, tr("Rename designed pit"), str(e))
+            return
+        self._drillholes_changed()
+        if self.survey_manager is not None:
+            self.survey_manager.reload_designs()
+
+    def delete_design(self, layer, did) -> None:
+        x = layer.data.design(did) if layer.data is not None else None
+        store = self._design_store(layer)
+        if x is None or store is None:
+            return
+        if QMessageBox.question(self, tr("Delete designed pit"),
+                                tr("Delete the designed pit {name} from the database?\n"
+                                   "The surveyed pits are not changed.", name=x.name)) != QMessageBox.Yes:
+            return
+        try:
+            store.delete_design(did)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, tr("Delete designed pit"), str(e))
+            return
+        layer.pit_styles.pop(f"d{did}", None)
+        self._drillholes_changed()
+        if self.survey_manager is not None:
+            self.survey_manager.reload_designs()
 
     def set_pit_style(self, layer, pid, **kw) -> None:
         """A pit's display setting changed (layers list or properties): draw it, keep the
@@ -1503,6 +1851,10 @@ class MainWindow(QMainWindow):
             self.open_paths(paths)
 
     def closeEvent(self, e):
+        bmm = getattr(self, "block_manager", None)
+        if bmm is not None and bmm.dirty and not self.quiet_errors and not bmm._confirm_discard():
+            e.ignore()                              # unsaved block model changes: the user chose Cancel
+            return
         self._auto_timer.stop()
         self._autosave_poll.stop()
         self._autosave_timer.stop()
@@ -1510,6 +1862,8 @@ class MainWindow(QMainWindow):
             thread.quit()
             thread.wait(2000)
         self._autosave(force=True)
+        if "geoviewer.blockmodel.parallel" in sys.modules:       # estimation worker processes, if started
+            sys.modules["geoviewer.blockmodel.parallel"].shutdown()
         self.identify.panel.close()
         self.measure.panel.close()
         if self.hole_dialog is not None:
@@ -1520,6 +1874,8 @@ class MainWindow(QMainWindow):
             self.drillhole_manager.close()
         if self.survey_manager is not None:
             self.survey_manager.close()
+        if self.pit_geology is not None:
+            self.pit_geology.close()
         if getattr(self, "map_export", None) is not None:
             self.map_export.close()
         self._section_timer.stop()

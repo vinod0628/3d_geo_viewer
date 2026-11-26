@@ -1,7 +1,9 @@
 """Application entry point: ``python -m geoviewer [-w FOLDER] [files...]``.
 
 Options:
-  -w, --workspace FOLDER   open this workspace folder (instead of the last one).
+  -w, --workspace FOLDER   open this workspace folder (instead of the last one). When
+                           GeoViewer is already running, that window closes its workspace and
+                           opens this one; no second window starts (see single_instance.py).
   --smoke-test             open the window, load the given workspace / files, then quit by
                            itself. Exit code 0 = loaded without errors, 2 = load errors,
                            3 = timeout. Used by the release build to check the packaged .exe.
@@ -215,6 +217,14 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication(argv)
     app.setApplicationName("GeoViewer")
     app.setOrganizationName("GeoViewer")
+    # GeoViewer already open: "-w FOLDER" (or files) goes to that window instead of a new one.
+    # The smoke test always runs on its own and never takes requests.
+    forward = not smoke and (args.workspace or args.files)
+    if forward:
+        from .single_instance import make_request, send_to_running
+
+        if send_to_running(make_request(args.workspace, args.files)):
+            return 0
     apply_language(app)                       # before any window is made: texts are read once
     from .ui.icons import app_icon
 
@@ -241,8 +251,15 @@ def main(argv: list[str] | None = None) -> int:
 
         database.configure(database.DatabaseConfig(backend="sqlite"))
     win.showMaximized()
-    if args.workspace:
-        win.open_workspace(args.workspace, confirm=False)
+    instance = None
+    if not smoke:                   # later starts with -w hand their workspace to this window
+        from .single_instance import InstanceServer
+
+        instance = InstanceServer(app)
+        instance.requested.connect(win.handle_open_request)
+        instance.listen()
+    if args.workspace:             # a wrong folder: a status bar warning, the app opens empty
+        win.open_command_line_workspace(args.workspace)
     elif not args.files and not smoke:
         win.restore_last_workspace()
     if args.files:
@@ -250,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     if smoke:
         _arm_smoke_test(app, win)
     code = app.exec()
+    if instance is not None:
+        instance.close()
     watchdog.stop()
     if smoke and win.load_errors and sys.stderr is not None:
         sys.stderr.write("\n".join(win.load_errors) + "\n")

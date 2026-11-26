@@ -204,8 +204,14 @@ class ReserveManager(QObject):
     # --- the window --------------------------------------------------------------------------
     def show_window(self) -> None:
         self.sync()
+        park = getattr(self.win, "parking", None)
+        if self.window is not None and park is not None and park.restore("reserve"):
+            self.window.refresh()                   # as it was left (with the advisor, if open)
+            return
         if self.window is None:
             self.window = ReserveWindow(self)
+            if park is not None:
+                park.watch(self.window, "reserve")
         self.window.refresh()
         self.window.show()
         self.window.raise_()
@@ -318,7 +324,7 @@ class ReserveManager(QObject):
             self.win.status_msg.setText(tr("Saved {name} ({date}): {t:,.0f} t @ {g:,.2f} {unit} - draw the next "
                                            "outline or press Esc", name=sh.name, date=sh.date, t=tot.tonnes,
                                            g=tot.grade, unit=unit))
-        if self.window is not None and self.window.isVisible():
+        if self.window is not None:                 # also when hidden while drawing: shown selected on return
             self.window.select(sh.id)
 
     def delete_shape(self, sid: int) -> None:
@@ -461,6 +467,11 @@ class ReserveWindow(QDialog):
         top.addWidget(self.d_asof)
         top.addWidget(b_today)
         top.addStretch(1)
+        self.b_ai = QPushButton(icon("creation", "#f0b429"), tr("Advisor"))
+        self.b_ai.setToolTip(tr("How long the reserve lasts and a check of every cut, explained in plain words "
+                                "(worked out on this computer, changes nothing)"))
+        self.b_ai.clicked.connect(self._advisor)
+        top.addWidget(self.b_ai)
         top.addWidget(self.b_setup)
 
         self.card_total = _Card(N_("Total reserve"), "#8a94a3")
@@ -546,6 +557,22 @@ class ReserveWindow(QDialog):
             e.accept()
             return
         super().keyPressEvent(e)
+
+    def _advisor(self) -> None:
+        """The reserve advisor (forecast and cut check), next to this window."""
+        from .reserve_advisor_dialog import ReserveAdvisorDialog
+
+        dlg = getattr(self, "advisor", None)
+        if dlg is None or not dlg.isVisible():
+            self.advisor = dlg = ReserveAdvisorDialog(self.mgr, self)
+            park = getattr(self.mgr.win, "parking", None)
+            if park is not None:
+                park.watch(dlg, "reserve")
+        else:
+            dlg.refresh()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     @staticmethod
     def _table(cols, stretch: int | None = None) -> QTableWidget:
@@ -743,7 +770,11 @@ class ReserveWindow(QDialog):
             self.mgr.set_as_of(d.toString("yyyy-MM-dd"))
 
     def _draw(self) -> None:
-        self.mgr.win.start_mined_outline()
+        win = self.mgr.win
+        win.start_mined_outline()
+        park = getattr(win, "parking", None)
+        if park is not None and win.a_mined.isChecked():
+            park.park("reserve")                    # out of the way of the view; the Reserve button brings it back
 
     def _edit(self) -> None:
         sid = self._selected_id()

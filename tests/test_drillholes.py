@@ -4,17 +4,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from geoviewer.io import read_drillholes_access, read_drillholes_csv
+from geoviewer.io import read_drillholes_csv, read_drillholes_sqlite
 from geoviewer.io.drillholes import DrillholeDB, _direction
 
 
 @pytest.fixture(scope="module")
-def access_db(accdb):
-    return read_drillholes_access(accdb)
+def surpac_db(surpac_sqlite):
+    """The demo drillholes, read from Surpac-style tables (collar, survey, geology, sample, weathering)."""
+    return read_drillholes_sqlite(surpac_sqlite)
 
 
-def test_access_tables(access_db):
-    db = access_db
+def test_surpac_tables(surpac_db):
+    db = surpac_db
     assert len(db.collars) == 94
     assert len(db.surveys) == 163          # demo data: 14 holes made inclined / curved (2026-11-21)
     assert {"geology", "weathering", "sample"} <= set(db.intervals)
@@ -23,15 +24,15 @@ def test_access_tables(access_db):
     assert db.code_descriptions("geology", "rock")["B"] == "Basalt"
 
 
-def test_weathering_from_depths_are_filled(access_db):
-    w = access_db.intervals["weathering"]
+def test_weathering_from_depths_are_filled(surpac_db):
+    w = surpac_db.intervals["weathering"]
     h = w[w.hole_id == "WD004"]
     assert h.depth_from.tolist()[:2] == [0.0, 6.0]
     assert h.depth_to.tolist()[:2] == [6.0, 74.0]
 
 
-def test_trace_starts_at_collar_and_preserves_length(access_db):
-    db = access_db
+def test_trace_starts_at_collar_and_preserves_length(surpac_db):
+    db = surpac_db
     for hid in db.hole_ids[:20]:
         tr = db.trace(hid)
         np.testing.assert_allclose(tr.positions_at([0.0])[0], tr.collar)
@@ -42,8 +43,8 @@ def test_trace_starts_at_collar_and_preserves_length(access_db):
         np.testing.assert_allclose(tr.positions_at(tr.md), tr.xyz, atol=1e-6)
 
 
-def test_nearly_vertical_hole(access_db):
-    tr = access_db.trace("WD004")  # dips -90 .. -87
+def test_nearly_vertical_hole(surpac_db):
+    tr = surpac_db.trace("WD004")  # dips -90 .. -87
     p = tr.positions_at([100.0])[0]
     assert -100.0 <= p[2] - tr.collar[2] < -99.0
     assert np.linalg.norm(p[:2] - tr.collar[:2]) < 6.0
@@ -71,9 +72,9 @@ def test_direction_convention():
     np.testing.assert_allclose(_direction(np.array([0.0]), np.array([-90.0]))[0], [0, 0, -1], atol=1e-12)
 
 
-def test_csv_matches_access(access_db, tmp_path):
-    """Exporting the Access tables to CSV and reading them back gives the same traces."""
-    db = access_db
+def test_csv_matches_the_database(surpac_db, tmp_path):
+    """Exporting the drillhole tables to CSV and reading them back gives the same traces."""
+    db = surpac_db
     db.collars.to_csv(tmp_path / "collar.csv", index=False)
     db.surveys.to_csv(tmp_path / "survey.csv", index=False)
     db.intervals["geology"].to_csv(tmp_path / "lithology.csv", index=False)
@@ -87,10 +88,10 @@ def test_csv_matches_access(access_db, tmp_path):
     assert not csv.warnings
 
 
-def test_intervals_follow_a_curved_hole(access_db):
+def test_intervals_follow_a_curved_hole(surpac_db):
     """Regression: intervals were straight chords from 'from' to 'to', cutting across the bend
     of a curved hole (the grey trace showed beside them). They follow the path now."""
-    db = access_db
+    db = surpac_db
     rows, pts, deps, counts = db.interval_paths("geology")
     df = db.intervals["geology"]
     tr = db.trace("WD033")
@@ -116,12 +117,12 @@ def test_intervals_follow_a_curved_hole(access_db):
     assert r_v and all(counts[i] == 2 for i in r_v)
 
 
-def test_hole_log_for_the_identify_window(access_db):
+def test_hole_log_for_the_identify_window(surpac_db):
     from geoviewer.scene.layers import DrillholeLayer
 
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     log = lay.hole_log("WD033")
-    tr = access_db.trace("WD033")
+    tr = surpac_db.trace("WD033")
     np.testing.assert_allclose(log.collar, tr.collar)
     assert log.length == pytest.approx(120.0)
     assert log.depths[0] == 0.0 and log.depths[-1] == pytest.approx(120.0)
@@ -132,7 +133,7 @@ def test_hole_log_for_the_identify_window(access_db):
     assert (log.collar_azimuth, log.collar_dip) == (pytest.approx(90.0), pytest.approx(-60.0))
 
 
-def test_drillhole_log_page_and_print(access_db, tmp_path):
+def test_drillhole_log_page_and_print(surpac_db, tmp_path):
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -143,7 +144,7 @@ def test_drillhole_log_page_and_print(access_db, tmp_path):
     from geoviewer.ui.drillhole_log import DrillholeLogDialog
 
     app = QApplication.instance() or QApplication([])
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     dlg = DrillholeLogDialog()
     for hid in ("WD033", "WRC094"):                   # curved and vertical
         dlg.show_hole(lay.hole_log(hid), 40.0)
@@ -166,7 +167,7 @@ def test_drillhole_log_page_and_print(access_db, tmp_path):
     dlg.close()
 
 
-def test_drillhole_log_click_moves_the_depth_marker(access_db):
+def test_drillhole_log_click_moves_the_depth_marker(surpac_db):
     """Clicking the strip log or the path in the XZ / XY pane moves the marker in all views."""
     import os
 
@@ -179,7 +180,7 @@ def test_drillhole_log_click_moves_the_depth_marker(access_db):
     from geoviewer.ui.drillhole_log import DrillholeLogDialog
 
     app = QApplication.instance() or QApplication([])
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     dlg = DrillholeLogDialog()
     dlg.resize(1100, 760)
     dlg.show_hole(lay.hole_log("WD033"), 59.6)
@@ -223,7 +224,7 @@ def test_drillhole_log_click_moves_the_depth_marker(access_db):
     dlg.close()
 
 
-def test_drillhole_log_print_has_no_depth_marker(access_db):
+def test_drillhole_log_print_has_no_depth_marker(surpac_db):
     """The yellow / orange depth marker is for the screen only: not printed or exported."""
     import os
 
@@ -235,7 +236,7 @@ def test_drillhole_log_print_has_no_depth_marker(access_db):
     from geoviewer.ui.drillhole_log import PAPER, DrillholeLogDialog
 
     app = QApplication.instance() or QApplication([])
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     dlg = DrillholeLogDialog()
     dlg.show_hole(lay.hole_log("WD033"), 59.6)
     app.processEvents()
@@ -250,14 +251,14 @@ def test_drillhole_log_print_has_no_depth_marker(access_db):
     dlg.close()
 
 
-def test_azimuth_dip_follow_the_marked_depth(access_db):
+def test_azimuth_dip_follow_the_marked_depth(surpac_db):
     """The log header shows the direction at the marked depth: equal to the survey at the
     stations, turning smoothly in between (minimum curvature)."""
     from geoviewer.scene.layers import DrillholeLayer
 
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     log = lay.hole_log("WRC001")
-    sv = access_db.surveys[access_db.surveys.hole_id == "WRC001"]
+    sv = surpac_db.surveys[surpac_db.surveys.hole_id == "WRC001"]
     for d, az, dip in sv[["depth", "azimuth", "dip"]].itertuples(index=False):
         a, p = log.azimuth_dip(d)
         assert a == pytest.approx(az % 360.0, abs=0.05) or abs(a - az) == pytest.approx(360.0, abs=0.05)
@@ -266,11 +267,11 @@ def test_azimuth_dip_follow_the_marked_depth(access_db):
     a1, _ = log.azimuth_dip(7.86)
     a2, _ = log.azimuth_dip(10.0)
     assert a0 < a1 < a2                                 # turning between the stations
-    tr = access_db.trace("WRC001")
+    tr = surpac_db.trace("WRC001")
     np.testing.assert_allclose(tr.azimuth_dip_at(7.86), log.azimuth_dip(7.86), atol=0.2)
 
 
-def test_log_header_shows_direction_at_marker(access_db):
+def test_log_header_shows_direction_at_marker(surpac_db):
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -282,7 +283,7 @@ def test_log_header_shows_direction_at_marker(access_db):
     from geoviewer.scene.layers import DrillholeLayer
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     log = lay.hole_log("WRC001")
     texts = []
     real = QPainter.drawText
@@ -307,7 +308,7 @@ def test_log_header_shows_direction_at_marker(access_db):
     assert not any("dip -" in t for t in header)
 
 
-def test_log_has_no_eoh_labels(access_db):
+def test_log_has_no_eoh_labels(surpac_db):
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -319,7 +320,7 @@ def test_log_has_no_eoh_labels(access_db):
     from geoviewer.scene.layers import DrillholeLayer
 
     app = QApplication.instance() or QApplication([])  # noqa: F841
-    log = DrillholeLayer(name="surpac", path=None, data=access_db).hole_log("WD033")
+    log = DrillholeLayer(name="surpac", path=None, data=surpac_db).hole_log("WD033")
     texts, real = [], QPainter.drawText
 
     def spy(self, *args):
@@ -339,7 +340,7 @@ def test_log_has_no_eoh_labels(access_db):
     assert sum(t == "120.0 m" for t in texts) == 4          # hole end in XZ and XY, screen + paper
 
 
-def test_strip_log_zoom_and_pan(access_db):
+def test_strip_log_zoom_and_pan(surpac_db):
     """Wheel zooms the strip log around the cursor, dragging beside the diagram pans,
     double-click shows the whole hole; picks happen only on the diagram itself."""
     import os
@@ -354,7 +355,7 @@ def test_strip_log_zoom_and_pan(access_db):
     from geoviewer.ui.drillhole_log import DrillholeLogDialog
 
     app = QApplication.instance() or QApplication([])
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
     dlg = DrillholeLogDialog()
     dlg.resize(1100, 760)
     dlg.show_hole(lay.hole_log("WD033"), 50.0)
@@ -424,13 +425,13 @@ def test_strip_log_zoom_and_pan(access_db):
 
 
 
-def test_log_header_lines_follow_the_marker(access_db):
+def test_log_header_lines_follow_the_marker(surpac_db):
     """Header: hole (length) / depth and interval / X Y Z / azimuth and dip of the marked point."""
     from geoviewer.scene.layers import DrillholeLayer
     from geoviewer.ui.drillhole_log import header_lines
 
-    log = DrillholeLayer(name="surpac", path=None, data=access_db).hole_log("WRC001")
-    tr = access_db.trace("WRC001")
+    log = DrillholeLayer(name="surpac", path=None, data=surpac_db).hole_log("WRC001")
+    tr = surpac_db.trace("WRC001")
     a = header_lines(log, 31.9)
     assert a[0] == "Drillhole WRC001  (120.00 m)"
     assert a[1].startswith("Depth 31.90 m") and "QV1 Quartz vein" in a[1] and "(29.00–37.00 m)" in a[1]
@@ -444,13 +445,13 @@ def test_log_header_lines_follow_the_marker(access_db):
     assert c[1] == "Collar" and c[2] == f"X {cx:,.3f}     Y {cy:,.3f}     Z {cz:,.3f}"
 
 
-def test_desurvey_matches_minimum_curvature_reference(access_db):
+def test_desurvey_matches_minimum_curvature_reference(surpac_db):
     """Independent check against the published minimum-curvature formulas (Sawaryn &
     Thorogood, SPE 84246): station positions, the measured direction at every survey depth,
     points between stations on the circular arc of radius dMD / beta."""
     import math
 
-    db = access_db
+    db = surpac_db
     for hid in db.hole_ids:
         sv = db.surveys[db.surveys.hole_id == hid].sort_values("depth")
         if len(sv) < 2:
@@ -484,64 +485,52 @@ def test_desurvey_matches_minimum_curvature_reference(access_db):
         np.testing.assert_allclose(tr.direction_at(md), t_meas, atol=1e-9)   # survey honoured
 
 
-def test_sample_table_with_a_bad_primary_key_index_is_read(access_db):
-    """access-parser fails on the 'sample' table's index (KeyError); the rows are read anyway."""
-    s = access_db.intervals["sample"]
+def test_sample_table(surpac_db):
+    s = surpac_db.intervals["sample"]
     assert len(s) == 4813
     assert {"gold", "samp_id"} <= set(s.columns)
     assert s.gold.max() == pytest.approx(135.0)
 
 
 # --- drillholes in the project database (geodatabase.sqlite) ----------------------------------------
-def _fill_project_database(access_db, folder, sample=True):
+def _fill_project_database(surpac_db, folder, sample=True):
     """drillhole_ tables as a user would import them (e.g. from Excel), with their own column names."""
     from geoviewer.io.database import Database
 
-    c = access_db.collars[["hole_id", "x", "y", "z", "max_depth"]].rename(
+    c = surpac_db.collars[["hole_id", "x", "y", "z", "max_depth"]].rename(
         columns={"hole_id": "BHID", "x": "EAST", "y": "NORTH", "z": "RL", "max_depth": "EOH"})
-    survey = access_db.surveys.assign(dip=access_db.surveys["dip"] + 90.0)   # database: dip 0 = straight down
+    survey = surpac_db.surveys.assign(dip=surpac_db.surveys["dip"] + 90.0)   # database: dip 0 = straight down
     tables = {"drillhole_collar": c, "drillhole_survey": survey,
-              "drillhole_geology": access_db.intervals["geology"],
-              "drillhole_translation": access_db.translations}
+              "drillhole_geology": surpac_db.intervals["geology"],
+              "drillhole_translation": surpac_db.translations}
     if sample:
-        tables["drillhole_sample"] = access_db.intervals["sample"]
+        tables["drillhole_sample"] = surpac_db.intervals["sample"]
     with Database.sqlite(folder / "geodatabase.sqlite") as db:
         for name, df in tables.items():
             db.write_frame(name, df)
 
 
-def test_drillholes_are_read_from_the_project_database(access_db, tmp_path):
+def test_drillholes_are_read_from_the_project_database(surpac_db, tmp_path):
     from geoviewer.io.database import project_target
     from geoviewer.io.drillholes import drillhole_signature, project_has_drillholes, read_drillholes_sqlite
 
     target = project_target(tmp_path)
     assert not project_has_drillholes(target)
-    _fill_project_database(access_db, tmp_path)
+    _fill_project_database(surpac_db, tmp_path)
     assert project_has_drillholes(target)
     db = read_drillholes_sqlite(target)
     assert sorted(db.intervals) == ["geology", "sample"]
     pd.testing.assert_frame_equal(db.collars[["hole_id", "x", "y", "z", "max_depth"]],
-                                  access_db.collars[["hole_id", "x", "y", "z", "max_depth"]], check_dtype=False)
-    pd.testing.assert_frame_equal(db.intervals["sample"], access_db.intervals["sample"], check_dtype=False)
+                                  surpac_db.collars[["hole_id", "x", "y", "z", "max_depth"]], check_dtype=False)
+    pd.testing.assert_frame_equal(db.intervals["sample"], surpac_db.intervals["sample"], check_dtype=False)
     assert db.code_descriptions("geology", "rock")["B"] == "Basalt"
-    np.testing.assert_allclose(db.trace("WD033").xyz, access_db.trace("WD033").xyz)
+    np.testing.assert_allclose(db.trace("WD033").xyz, surpac_db.trace("WD033").xyz)
     sig = {name: (set(cols), rows) for name, cols, rows in drillhole_signature(target)}
     assert sig["drillhole_sample"] == ({"hole_id", "depth_from", "depth_to", "gold", "samp_id"}, 4813)
     assert sig["drillhole_collar"] == ({"BHID", "EAST", "NORTH", "RL", "EOH"}, 94)
 
 
-def test_accdb_is_read_directly_and_not_copied(accdb, tmp_path):
-    import shutil
-
-    from geoviewer.scene.loaders import load_paths
-
-    shutil.copy2(accdb, tmp_path / "surpac.accdb")
-    (lay,), errors = load_paths([tmp_path / "surpac.accdb"])
-    assert not errors and "sample" in lay.data.intervals
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["surpac.accdb"]
-
-
-def test_database_layer_in_the_workspace(access_db, tmp_path):
+def test_database_layer_in_the_workspace(surpac_db, tmp_path):
     import json
 
     from geoviewer.io import database
@@ -554,7 +543,7 @@ def test_database_layer_in_the_workspace(access_db, tmp_path):
     layers = [x for x in layers if x.name == "Drillholes (database)"]
     assert layers[0].data.collars.empty and "none yet" in dict(layers[0].info())["Holes"]
     assert ws.new_database_layers() == ([], [])              # shown already
-    _fill_project_database(access_db, tmp_path, sample=False)
+    _fill_project_database(surpac_db, tmp_path, sample=False)
     ((old, lay),), errors = reload_layers([layers[0]])        # e.g. Refresh after an import
     assert not errors and lay.name == "Drillholes (database)" and lay.source == "database"
     assert sorted(lay.data.intervals) == ["geology"]          # the empty assay table is not listed
@@ -564,7 +553,7 @@ def test_database_layer_in_the_workspace(access_db, tmp_path):
     assert spec["source"] == "database" and spec["files"] == []
     # the tables change (another import): Refresh reloads the layer, keeping its settings
     assert changed_layers([lay]).changed == []
-    _fill_project_database(access_db, tmp_path, sample=True)
+    _fill_project_database(surpac_db, tmp_path, sample=True)
     assert changed_layers([lay]).changed == [lay]
     ((old, new),), errs = reload_layers([lay])
     assert not errs and old is lay and sorted(new.data.intervals) == ["geology", "sample"]
@@ -580,7 +569,7 @@ def test_database_layer_in_the_workspace(access_db, tmp_path):
     assert [x.name for x in third.load()[0]] == ["Drillholes (database)", "Survey (database)"]
 
 
-def test_sqlite_files_are_not_data_files(access_db, accdb, tmp_path):
+def test_sqlite_files_are_not_data_files(surpac_db, tmp_path):
     """Drillholes come from the project database: SQLite files are not offered / scanned / opened."""
     import shutil
 
@@ -589,12 +578,12 @@ def test_sqlite_files_are_not_data_files(access_db, accdb, tmp_path):
 
     assert ".sqlite" not in SUPPORTED_EXTENSIONS and ".db" not in SUPPORTED_EXTENSIONS
     assert "sqlite" not in FILE_FILTER and "*.db" not in FILE_FILTER
-    shutil.copy2(accdb, tmp_path / "surpac.accdb")
-    _fill_project_database(access_db, tmp_path)
+    _fill_project_database(surpac_db, tmp_path)
     shutil.copy2(tmp_path / "geodatabase.sqlite", tmp_path / "holes.sqlite")
+    (tmp_path / "topo.str").write_text("topo,01-Jan-26,,\n0, 0.000, 0.000, 0.000,\n", encoding="utf-8")
     files = list_data_files(tmp_path)
-    assert {p.name for p in files} == {"surpac.accdb"}
-    assert [p.name for g in loadable_groups(files, files) for p in g] == ["surpac.accdb"]
+    assert {p.name for p in files} == {"topo.str"}                          # the SQLite files are not listed
+    assert [p.name for g in loadable_groups(files, files) for p in g] == ["topo.str"]
     _, errors = load_paths([tmp_path / "holes.sqlite"])
     assert errors and "Unsupported file type" in errors[0]
 
@@ -615,27 +604,27 @@ def test_unreachable_mysql_gives_a_message_not_a_layer(tmp_path):
     assert type(survey).__name__ == "SurveyLayer" and survey.offline and survey.data.pits == []
 
 
-def test_project_database_opened_as_a_file_becomes_the_database_layer(access_db, tmp_path):
+def test_project_database_opened_as_a_file_becomes_the_database_layer(surpac_db, tmp_path):
     """An earlier version could list geodatabase.sqlite as a file layer: it loads as the database layer."""
     from geoviewer.io import database
     from geoviewer.workspace import load_spec
 
     database.set_project_folder(tmp_path)
-    _fill_project_database(access_db, tmp_path)
+    _fill_project_database(surpac_db, tmp_path)
     spec = {"name": "geodatabase", "type": "DrillholeLayer", "part": "", "files": ["geodatabase.sqlite"], "settings": {}}
     layer, errors = load_spec(spec, tmp_path)
     assert not errors and layer.source == "database" and layer.name == "Drillholes (database)"
     assert layer.inputs == [] and len(layer.data.collars) == 94
 
 
-def test_refresh_does_not_query_an_unchanged_sqlite_database(access_db, tmp_path, monkeypatch):
+def test_refresh_does_not_query_an_unchanged_sqlite_database(surpac_db, tmp_path, monkeypatch):
     import geoviewer.workspace as wsmod
     from geoviewer.io import database
     from geoviewer.scene.loaders import load_database_drillholes
     from geoviewer.scene.production import MinedShape, ProductionLog
 
     database.set_project_folder(tmp_path)
-    _fill_project_database(access_db, tmp_path, sample=False)
+    _fill_project_database(surpac_db, tmp_path, sample=False)
     layer, _ = load_database_drillholes(tmp_path)
     calls = []
     real = wsmod.database_signature
@@ -646,17 +635,17 @@ def test_refresh_does_not_query_an_unchanged_sqlite_database(access_db, tmp_path
     assert wsmod.changed_layers([layer]).changed == [] and len(calls) == 1   # remembered: no query again
 
 
-def test_database_dip_is_measured_from_straight_down(access_db, tmp_path):
+def test_database_dip_is_measured_from_straight_down(surpac_db, tmp_path):
     """drillhole_survey dips: 0 = straight down, 90 = horizontal; paths match the Surpac data."""
     from geoviewer.io.database import project_target
     from geoviewer.io.drillholes import display_dip, read_drillholes_sqlite
 
-    _fill_project_database(access_db, tmp_path, sample=False)
+    _fill_project_database(surpac_db, tmp_path, sample=False)
     db = read_drillholes_sqlite(project_target(tmp_path))
     assert db.dip_zero_down and not db.dip_positive_down
     assert db.surveys["dip"].between(0, 90).all()                 # e.g. 0 vertical, 30 for Surpac -60
     for hid in ("WD004", "WD033", "WRC001"):
-        np.testing.assert_allclose(db.trace(hid).xyz, access_db.trace(hid).xyz, atol=1e-9)
+        np.testing.assert_allclose(db.trace(hid).xyz, surpac_db.trace(hid).xyz, atol=1e-9)
     # a hand-made hole: dip 0 goes straight down, dip 90 goes level
     collar = pd.DataFrame({"hole_id": ["V", "H"], "x": [0.0, 0.0], "y": [0.0, 0.0], "z": [100.0, 100.0],
                            "max_depth": [50.0, 50.0]})
@@ -671,7 +660,7 @@ def test_database_dip_is_measured_from_straight_down(access_db, tmp_path):
     assert display_dip(-60.0) == 30.0 and str(display_dip(-90.0)) == "0.0"
 
 
-def test_log_grade_graphs_one_per_field_up_to_two(access_db):
+def test_log_grade_graphs_one_per_field_up_to_two(surpac_db):
     """Beside the strip log: a graph per numeric field (at most two), a combobox above each to
     pick the field; Surpac's -1 (below detection) is drawn as 0, -2 (not analysed) is a gap."""
     import os
@@ -688,8 +677,8 @@ def test_log_grade_graphs_one_per_field_up_to_two(access_db):
     assert graph_values([(0, 1, 2.5), (1, 2, -1.0), (2, 3, -2.0), (3, 4, 0.7)]) == [(0, 1, 2.5), (1, 2, 0.0),
                                                                                    (3, 4, 0.7)]
     assert grade_text(-1.0) == "below detection" and grade_text(-2.0) == "not analysed" and grade_text(None) == "–"
-    lay = DrillholeLayer(name="surpac", path=None, data=access_db)
-    assert [name for name, _t, _c in lay.grade_fields()] == ["gold"]          # the accdb has one grade
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
+    assert [name for name, _t, _c in lay.grade_fields()] == ["gold"]          # the demo holes have one grade
     log = lay.hole_log("WD033")
     rows = log.grades["gold"]
     assert rows and rows == sorted(rows) and all(b > a for a, b, _v in rows)
@@ -772,3 +761,56 @@ def test_scale_bar_goes_to_a_corner_clear_of_the_hole():
     everywhere = np.array([[x, y] for y in np.linspace(55, 445, 40) for x in (105, 695)])
     g = scale_bar_place(box, mpp, SCREEN, everywhere)
     assert g["corner"] in ("bottom-left", "bottom-right", "top-left", "top-right") and box.contains(g["frame"])
+
+
+def test_drillholes_in_a_section_are_thick_lines_from_the_corridor(surpac_db):
+    """A hole drawn as a cylinder (diameter 4 m) shows in a section as thick lines along its path, also when
+    the section passes beside it (within the corridor), with its name and the interval legend."""
+    import pyvista as pv
+
+    from geoviewer.scene.layers import DrillholeLayer
+    from geoviewer.scene.scene import Scene
+    from geoviewer.scene.section import SectionLine, build_section
+
+    sc = Scene(pv.Plotter(off_screen=True))
+    lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
+    assert lay.diameter > 0                                        # the default: cylinders in 3D
+    sc.add_layer(lay)
+    c = surpac_db.trace("WD033").collar - sc.origin
+    for offset in (0.0, 5.0):                                      # on the hole's plane, and 5 m beside it
+        y = c[1] + offset
+        line = SectionLine(np.array([[c[0] - 50.0, y, 0.0], [c[0] + 150.0, y, 0.0]]), axis=2)
+        res = build_section(sc, line, 10.0)
+        assert "WD033" in [text for _u, _v, _d, text in res.labels]
+        assert res.legends                                         # the rock codes cut
+        drawn = [a for a in res.actors if a.GetMapper().GetInput().GetNumberOfLines() > 0]
+        assert drawn and all(a.GetMapper().GetInput().GetNumberOfPolys() == 0 for a in drawn)
+        assert max(a.GetProperty().GetLineWidth() for a in drawn) >= 7.0
+    sc.plotter.close()
+
+
+def test_the_corridor_decides_which_holes_a_section_shows(surpac_db):
+    """A hole 30 m beside the section line: left out with a 10 m corridor, drawn with a 65 m one (whatever
+    the hole's diameter in 3D)."""
+    import pyvista as pv
+
+    from geoviewer.scene.layers import DrillholeLayer
+    from geoviewer.scene.scene import Scene
+    from geoviewer.scene.section import SectionLine, build_section
+
+    for diameter in (0.0, 1.5):
+        sc = Scene(pv.Plotter(off_screen=True))
+        lay = DrillholeLayer(name="surpac", path=None, data=surpac_db)
+        lay.diameter = diameter
+        sc.add_layer(lay)
+        tr = surpac_db.trace("WD033")
+        p = tr.path(step=2.0) - sc.origin                         # the hole runs east (azimuth 90)
+        y = float(p[:, 1].mean()) + 30.0
+        line = SectionLine(np.array([[p[:, 0].min() - 20, y, 0.0], [p[:, 0].max() + 20, y, 0.0]]), axis=2)
+
+        def shown(hw):
+            res = build_section(sc, line, hw)
+            return "WD033" in [text for _u, _v, _d, text in res.labels]
+
+        assert not shown(10.0) and shown(65.0), diameter
+        sc.plotter.close()

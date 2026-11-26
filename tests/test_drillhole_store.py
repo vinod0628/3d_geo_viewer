@@ -12,6 +12,9 @@ from geoviewer.io.drillhole_store import ASSAY, COLLAR, GEOLOGY, STYLES, SURVEY,
 
 
 INFO_FIELDS = ["organization", "drilling_manager", "geology_surveyor", "start_date", "end_date", "state"]
+DRILLING_FIELDS = ["area_id", "rig_model", "plan_azimuth", "plan_dip", "planned_depth", "casing_available",
+                   "fluids_available", "crew", "notes"]           # the drilling records (drilling_schema.py)
+GEOLOGY_DRILLING = ["formation", "weathering", "broken", "bedding_angle"]
 
 
 def _imported(folder):
@@ -52,7 +55,8 @@ def test_prepare_adds_what_is_missing_and_keeps_everything(tmp_path):
     # an empty database gets all tables
     empty = DrillholeStore(project_target(tmp_path / "new"))
     (tmp_path / "new").mkdir()
-    assert len(empty.prepare()) == 6 and empty.hole_ids() == []
+    made = [n for n in empty.prepare() if n.startswith("made table")]
+    assert len(made) == 6 + 9 and empty.hole_ids() == []               # + the drilling record tables
 
 
 def test_init_never_removes_tables_fields_or_rows(tmp_path):
@@ -75,11 +79,11 @@ def test_init_never_removes_tables_fields_or_rows(tmp_path):
     assert not any(ASSAY in n for n in added)
     assert "made the production tables" in notes
     with Database.sqlite(tmp_path / "geodatabase.sqlite", create=False) as db:
-        assert db.columns(COLLAR) == ["BHID", "EAST", "NORTH", "RL", "EOH", "contractor"] + INFO_FIELDS
-        assert db.query(f"SELECT * FROM {COLLAR}") == [("A", 1.0, 2.0, 3.0, 50.0, "X Drilling") + (None,) * 6]
+        assert db.columns(COLLAR) == ["BHID", "EAST", "NORTH", "RL", "EOH", "contractor"] + INFO_FIELDS +             DRILLING_FIELDS
+        assert db.query(f"SELECT * FROM {COLLAR}") == [("A", 1.0, 2.0, 3.0, 50.0, "X Drilling") + (None,) * 15]
         assert db.columns(ASSAY) == ["hole_id", "depth_from", "depth_to", "cu_pct"]      # gold not added back
         assert db.query(f"SELECT * FROM {ASSAY}") == [("A", 0.0, 1.0, 0.8)]
-        assert db.query(f"SELECT * FROM {GEOLOGY}") == [("A", 0.0, 5.0, None, None)]   # rock, note added
+        assert db.query(f"SELECT * FROM {GEOLOGY}") == [("A", 0.0, 5.0) + (None,) * 6]   # rock, note, ... added
         assert db.query("SELECT * FROM drillhole_notes") == [("A", "keep me")]
         assert db.query("SELECT COUNT(*) FROM my_own_table") == [(3,)]
     assert init_project_database(target, tmp_path) == []                                # all there now
@@ -100,9 +104,10 @@ def test_holes_keep_the_imported_column_names(tmp_path):
     assert store.hole_ids() == ["H1", "H2"]
     h = store.load_hole("H1")
     assert h.collar == {"EAST": 100.0, "NORTH": 10.0, "RL": 50.0, "EOH": 30.0, "section": "7120",
-                        **dict.fromkeys(INFO_FIELDS)}                      # information fields added, empty
+                        **dict.fromkeys(INFO_FIELDS + DRILLING_FIELDS)}    # information fields added, empty
     assert h.tables[GEOLOGY].to_dict("list") == {"from": [0.0, 10.0], "to": [10.0, 30.0], "rock": ["SH", "QV1"],
-                                                 "note": [None, None]}            # note added by prepare
+                                                 "note": [None, None],            # note added by prepare
+                                                 **{c: [None, None] for c in GEOLOGY_DRILLING}}
     assert list(h.tables[ASSAY].columns) == ["depth_from", "depth_to", "gold", "silver"]
     # edit: longer hole, a new geology split, assays, rename to H1A
     h.collar["EOH"] = "35"
@@ -214,7 +219,7 @@ def test_manager_window_edits_and_saves_a_hole(tmp_path, monkeypatch):
     assert dlg.hid == "H1" and dlg.g_geology.table.rowCount() == 2
     assert dlg.t_rocks.rowCount() == 3                                         # QV1, SH, ST
     # edit a rock code and its note, add an assay row, then save
-    assert dlg.g_geology.columns == ["from", "to", "rock", "note"]
+    assert dlg.g_geology.columns == ["from", "to", "rock", "note"] + GEOLOGY_DRILLING
     dlg.g_geology.table.item(1, 2).setText("ST")
     dlg.g_geology.table.item(1, 3).setText("sheared, chlorite")
     assert dlg.dirty and dlg.b_save.isEnabled()
@@ -352,7 +357,9 @@ def test_collar_information_fields(tmp_path):
     store.prepare()
     ci = store.info(COLLAR)
     ok = {"EAST": "1", "NORTH": "2", "RL": "3", "EOH": "40"}
-    assert HOLE_STATES == {1: "In work", 2: "Completed with ore hit", 3: "Completed without ore hit", 4: "Failed"}
+    assert list(HOLE_STATES.items()) == [(5, "Planned"), (1, "In work"), (2, "Completed with ore hit"),
+                                         (3, "Completed without ore hit"), (4, "Failed")]
+    assert state_code(6) == 3 and state_code("Completed") == 3          # "Completed" of an earlier version
     assert [state_code(v) for v in (2, "2", 2.0, "Failed", "in work", "", None, 7, "Done")] == \
         [2, 2, 2, 4, 1, None, None, None, None]
     assert state_text(3) == "Completed without ore hit" and state_text(None) == ""
@@ -360,7 +367,7 @@ def test_collar_information_fields(tmp_path):
         assert "SMALLINT" in db.column_types(COLLAR)["state"]
     errors, _w = check_hole(ci, {**ok, "start_date": "2026-03-10", "end_date": "2026-03-02", "state": "Done"}, {})
     assert "Collar: the end date is before the start date" in errors
-    assert any(e.startswith("Collar: state must be one of: In work") for e in errors)
+    assert any(e.startswith("Collar: state must be one of: Planned, In work") for e in errors)
     errors, _w = check_hole(ci, {**ok, "start_date": "10/03/2026"}, {})
     assert errors == ["Collar: start date must be a date like 2026-03-31"]
     assert check_hole(ci, {**ok, "start_date": "2026-03-01", "end_date": "", "state": "1"}, {})[0] == []

@@ -594,7 +594,7 @@ class BlockModelLayer(Layer):
     value_min: float | None = None     # filter: show blocks with value >= min
     value_max: float | None = None     # filter: show blocks with value <= max
     clim: tuple[float, float] | None = None
-    show_edges: bool = True
+    show_edges: bool = False             # block edges off by default (user request); a setting per layer
     edge_color: RGB = (0.05, 0.05, 0.05)
     # constraint: conditions (see scene/constraints.py) combined by "and", "or" or an expression
     constraints: list = field(default_factory=list)
@@ -948,6 +948,10 @@ class BlockModelLayer(Layer):
 
 
 # ---------------------------------------------------------------------------
+SECTION_TRACE_WIDTH = 2.5         # px: drillholes in cross-sections are thick lines along the hole path
+SECTION_INTERVAL_WIDTH = 7.0
+
+
 @dataclass(eq=False)
 class DrillholeLayer(Layer):
     data: DrillholeDB | None = None
@@ -959,10 +963,15 @@ class DrillholeLayer(Layer):
     trace_color: RGB = (0.55, 0.55, 0.55)
     show_labels: bool = True
     category_colors: dict[str, RGB] = field(default_factory=dict)
+    # drilling area shown (drillhole_collar.area_id): AREA_AUTO = the areas of the holes being drilled or
+    # planned (all holes when there are none), AREA_ALL, or one area id
+    area: str = "auto"
+    all_data: DrillholeDB | None = field(default=None, repr=False)     # every hole; ``data`` = those shown
     _trace_holes: list = field(default_factory=list, repr=False)
 
+    AREA_AUTO, AREA_ALL = "auto", "*"
     SETTINGS = Layer.SETTINGS + ("table", "field_name", "cmap", "diameter", "show_labels",
-                                 "category_colors")
+                                 "category_colors", "area")
 
     def _setting_ok(self, key, value):
         db = self.data
@@ -976,6 +985,8 @@ class DrillholeLayer(Layer):
         db = self.data
         if db is None:
             return
+        self.all_data = db
+        self.data = self.shown_data()
         if self.table is None and db.intervals:
             prefer = [t for t in db.intervals if t.lower() in ("geology", "lithology", "litho", "lith")]
             self.table = (prefer or list(db.intervals))[0]
@@ -983,6 +994,36 @@ class DrillholeLayer(Layer):
             cols = self.field_columns(self.table)
             prefer = [c for c in cols if c.lower() in ("rock", "lith", "lithology", "litho", "code")]
             self.field_name = (prefer or cols or [None])[0]
+
+    # --- drilling areas ------------------------------------------------------------------------
+    def shown_areas(self) -> list[str] | None:
+        """The areas shown (None: every hole). A database with holes of several areas - e.g. the
+        drilling history of distant areas, kept for the risk prediction - shows by default only the
+        areas being drilled or planned."""
+        db = self.all_data
+        counts = db.area_counts() if db is not None else {}
+        if not counts or self.area == self.AREA_ALL:
+            return None
+        if self.area in counts:
+            return [self.area]
+        live = db.live_areas()
+        return live if live and len(counts) > 1 else None
+
+    def shown_data(self) -> DrillholeDB:
+        areas = self.shown_areas()
+        return self.all_data if areas is None else self.all_data.only_areas(areas)
+
+    def set_area(self, area: str) -> None:
+        self.area = area or self.AREA_AUTO
+        self.data = self.shown_data()
+        self.rebuild()
+
+    def apply_settings(self, d: dict) -> None:
+        if self.all_data is not None:
+            self.data = self.all_data                # the saved table / field are checked against every hole
+        super().apply_settings(d)
+        if self.all_data is not None:
+            self.data = self.shown_data()
 
     def field_columns(self, table: str) -> list[str]:
         df = self.data.intervals[table]
@@ -1017,10 +1058,12 @@ class DrillholeLayer(Layer):
         trace.point_data["gv_depth"] = np.concatenate(depths)
         radius = max(0.0, float(self.diameter or 0.0)) / 2          # the layer's Diameter, metres
         if radius > 0:                                  # the trace a little thinner than the intervals
-            self._add(trace.tube(radius=radius * 0.6, n_sides=8).triangulate(), color=self.trace_color,
-                      opacity=self.opacity)
+            act = self._add(trace.tube(radius=radius * 0.6, n_sides=8).triangulate(), color=self.trace_color,
+                            opacity=self.opacity)
+            act._gv_lines = trace                       # sections draw the path, not the cylinder outline
         else:
-            self._add(trace, color=self.trace_color, line_width=1.5, lighting=False, opacity=self.opacity)
+            act = self._add(trace, color=self.trace_color, line_width=1.5, lighting=False, opacity=self.opacity)
+        act._gv_section_width = SECTION_TRACE_WIDTH
 
         # Intervals coloured by the chosen field.
         if self.table and self.field_name:
@@ -1050,17 +1093,21 @@ class DrillholeLayer(Layer):
                     mesh.cell_data[self.field_name] = v
                     fin = v[np.isfinite(v)]
                     clim = (float(fin.min()), float(fin.max())) if len(fin) else (0, 1)
+                    lines = mesh
                     if radius > 0:
                         mesh = mesh.tube(radius=radius, n_sides=12).triangulate()   # triangles: pickable; data kept
-                    self._add(mesh, scalars=self.field_name, cmap=self.cmap, clim=clim,
-                              nan_color=self.trace_color, **kw)
+                    act = self._add(mesh, scalars=self.field_name, cmap=self.cmap, clim=clim,
+                                    nan_color=self.trace_color, **kw)
+                    act._gv_lines, act._gv_section_width = lines, SECTION_INTERVAL_WIDTH
                 else:
                     codes = col.astype(str).where(col.notna(), "")
                     rgb = np.array([_to_u8(self.code_color(c)) for c in codes], dtype=np.uint8)
                     mesh.cell_data["rgb"] = rgb
+                    lines = mesh
                     if radius > 0:
                         mesh = mesh.tube(radius=radius, n_sides=12).triangulate()   # triangles: pickable; data kept
-                    self._add(mesh, scalars="rgb", rgb=True, **kw)
+                    act = self._add(mesh, scalars="rgb", rgb=True, **kw)
+                    act._gv_lines, act._gv_section_width = lines, SECTION_INTERVAL_WIDTH
 
         if self.show_labels and collars:
             act = self.scene.plotter.add_point_labels(
@@ -1111,8 +1158,12 @@ class DrillholeLayer(Layer):
         if self.source == "database" and db.collars.empty:
             return super().info() + [(tr("Holes"), tr("none yet - add them with Drillholes (Ctrl+D) or import "
                                                       "drillhole_collar, drillhole_survey, ..."))]
+        total = len(self.all_data.collars) if self.all_data is not None else len(db.collars)
+        areas = self.shown_areas() if self.all_data is not None else None
+        holes = f"{len(db.collars):,}" if areas is None else tr(
+            "{n:,} of {total:,} (area {areas})", n=len(db.collars), total=total, areas=", ".join(areas))
         return super().info() + [
-            (tr("Holes"), f"{len(db.collars):,}"),
+            (tr("Holes"), holes),
             (tr("Survey records"), f"{len(db.surveys):,}"),
             (tr("Interval tables"), ", ".join(f"{k} ({len(v):,})" for k, v in db.intervals.items())),
             (tr("Warnings"), "; ".join(db.warnings) or "-"),

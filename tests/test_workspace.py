@@ -16,19 +16,13 @@ from geoviewer.workspace import (
     reload_layers,
 )
 
-FILES = ["pit1.dtm", "pit1.str", "gold_dtm.ssi", "layout1.str", "block_model.csv",
-         "surpac.accdb", "surpac.ddb"]
+FILES = ["pit1.dtm", "pit1.str", "gold_dtm.ssi", "layout1.str", "ore1_bm.gvbm"]
 
 
 @pytest.fixture()
-def ws_dir(demo, accdb, tmp_path):
+def ws_dir(demo, tmp_path):
     for f in FILES:
-        if f == "surpac.accdb":
-            shutil.copy2(accdb, tmp_path / f)
-        elif f == "surpac.ddb" and not (demo / f).exists():
-            (tmp_path / f).write_text("Surpac drillhole database definition (stand-in for the tests)\n")
-        else:
-            shutil.copy2(demo / f, tmp_path / f)
+        shutil.copy2(demo / f, tmp_path / f)
     old = time.time() - 60  # well past the "still being written" window
     for f in FILES:
         os.utime(tmp_path / f, (old, old))
@@ -48,24 +42,58 @@ def test_scan_skips_paired_and_duplicate_files(ws_dir):
     files = list_data_files(ws_dir)
     groups = loadable_groups(files, files)
     chosen = sorted(p.name for g in groups for p in g)
-    # pit1.str belongs to pit1.dtm; surpac.ddb is the same database as surpac.accdb.
-    assert chosen == ["block_model.csv", "layout1.str", "pit1.dtm", "surpac.accdb"]
+    # pit1.str belongs to pit1.dtm
+    assert chosen == ["layout1.str", "ore1_bm.gvbm", "pit1.dtm"]
 
 
 def test_open_folder_without_workspace_file(ws_dir):
     layers, errors, view = Workspace(ws_dir).load()
     assert not errors and view is None
     # the project database's drillhole layer is always listed (made empty by the database set-up)
-    assert _names(layers) == ["Drillholes (database)", "Survey (database)", "block_model", "layout1", "pit1",
-                              "surpac"]
+    assert _names(layers) == ["Drillholes (database)", "Survey (database)", "layout1", "ore1_bm", "pit1"]
     pit = next(lay for lay in layers if lay.name == "pit1")
     assert {p.name for p in pit.sources} == {"pit1.dtm", "pit1.str", "gold_dtm.ssi"}
+
+
+def test_block_model_csv_is_imported_not_loaded(ws_dir, demo):
+    """A block model CSV never becomes a layer: the workspace lists it for the import (.gvbm),
+    from the folder scan, from Refresh and from a CSV layer of an older workspace file."""
+    shutil.copy2(demo / "block_model.csv", ws_dir / "block_model.csv")
+    _age(ws_dir / "block_model.csv")
+    ws = Workspace(ws_dir)
+    layers, errors, _ = ws.load()
+    assert not errors
+    assert "block_model" not in _names(layers)
+    assert [p.name for p in ws.block_csvs] == ["block_model.csv"]
+    ws.save(layers, None)
+
+    # an older workspace file with the CSV as a layer: not loaded, listed for the import
+    data = json.loads((ws_dir / WORKSPACE_FILE).read_text(encoding="utf-8"))
+    data["layers"].append({"name": "block_model", "type": "BlockModelLayer", "part": "",
+                           "files": ["block_model.csv"], "settings": {}})
+    (ws_dir / WORKSPACE_FILE).write_text(json.dumps(data), encoding="utf-8")
+    ws2 = Workspace(ws_dir)
+    layers2, errors, _ = ws2.load()
+    assert not errors and "block_model" not in _names(layers2)
+    assert [p.name for p in ws2.block_csvs] == ["block_model.csv"]
+
+    # a CSV that appears later: Refresh lists it; with its .gvbm next to it, it was imported already
+    ws2.block_csvs = []
+    shutil.copy2(demo / "block_model.csv", ws_dir / "more.csv")
+    _age(ws_dir / "more.csv")
+    (ws_dir / "other.csv").write_bytes((demo / "block_model.csv").read_bytes())
+    shutil.copy2(demo / "ore1_bm.gvbm", ws_dir / "other.gvbm")
+    _age(ws_dir / "other.csv")
+    _age(ws_dir / "other.gvbm")
+    groups, _waiting = ws2.find_new_files()
+    assert [p.name for p in ws2.block_csvs] == ["more.csv"]
+    assert sorted(p.name for g in groups for p in g) == ["other.gvbm"]
 
 
 def test_save_and_reopen_keeps_settings_and_view(ws_dir):
     ws = Workspace(ws_dir)
     layers, _, _ = ws.load()
-    bm = next(lay for lay in layers if lay.name == "block_model")
+    bm = next(lay for lay in layers if lay.name == "ore1_bm")
     bm.opacity, bm.cmap, bm.value_min, bm.visible = 0.4, "viridis", 2.5, False
     pit = next(lay for lay in layers if lay.name == "pit1")
     pit.color, pit.use_styles = (0.1, 0.2, 0.3), False
@@ -79,7 +107,7 @@ def test_save_and_reopen_keeps_settings_and_view(ws_dir):
     layers2, errors, view2 = Workspace(ws_dir).load()
     assert not errors
     assert [lay.name for lay in layers2] == [lay.name for lay in layers]  # same order
-    bm2 = next(lay for lay in layers2 if lay.name == "block_model")
+    bm2 = next(lay for lay in layers2 if lay.name == "ore1_bm")
     assert (bm2.opacity, bm2.cmap, bm2.value_min, bm2.visible) == (0.4, "viridis", 2.5, False)
     pit2 = next(lay for lay in layers2 if lay.name == "pit1")
     assert pit2.color == (0.1, 0.2, 0.3) and pit2.use_styles is False

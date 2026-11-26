@@ -141,10 +141,17 @@ def test_pick_string_near_line(scene, demo):
     assert "Length 3D" in rows and "Description" in rows
 
 
-def test_pick_drillhole_interval(scene, accdb):
+def _demo_drillholes(path):
+    """The demo drillholes as a layer (Surpac-style tables in a plain SQLite file)."""
+    from geoviewer.io.drillholes import read_drillholes_sqlite
+    from geoviewer.scene.layers import DrillholeLayer
+
+    return DrillholeLayer(name="demo_drillholes", path=path, data=read_drillholes_sqlite(path))
+
+
+def test_pick_drillhole_interval(scene, surpac_sqlite):
     sc = scene
-    layers, errors = load_paths([accdb])
-    dh = layers[0]
+    dh = _demo_drillholes(surpac_sqlite)
     _show_only(sc, dh, view="xz")
     df, pf, pt = dh.data.interval_positions(dh.table)
     for k in np.flatnonzero(np.isfinite(pf).all(axis=1))[[0, 5]]:
@@ -222,11 +229,11 @@ def test_highlight_does_not_take_part_in_picking(scene, demo):
     sc.clear_highlight()
 
 
-def test_drillholes_as_cylinders_of_the_set_diameter(scene, accdb):
+def test_drillholes_as_cylinders_of_the_set_diameter(scene, surpac_sqlite):
     """The drillhole layer's Diameter: the intervals become cylinders of that diameter;
     clicking one still identifies it (hole, depth)."""
     sc = scene
-    (dh,), _ = load_paths([accdb])
+    dh = _demo_drillholes(surpac_sqlite)
     assert dh.diameter == 4.0                                            # the default
     _show_only(sc, dh, view="xz")
     meshes = [getattr(getattr(a, "mapper", None), "dataset", None) for a in dh.actors]   # labels: none
@@ -249,11 +256,11 @@ def test_drillholes_as_cylinders_of_the_set_diameter(scene, accdb):
     assert next(m for m in meshes if m is not None and "gv_row" in m.cell_data).n_lines > 0
 
 
-def test_drillhole_diameter_is_saved_with_the_layer(accdb):
-    (dh,), _ = load_paths([accdb])
+def test_drillhole_diameter_is_saved_with_the_layer(surpac_sqlite):
+    dh = _demo_drillholes(surpac_sqlite)
     dh.diameter = 2.5
     assert dh.settings()["diameter"] == 2.5 and "line_width" not in dh.settings()
-    (again,), _ = load_paths([accdb])
+    again = _demo_drillholes(surpac_sqlite)
     again.apply_settings({"diameter": 2.5, "line_width": 9})               # an old workspace: width ignored
     assert again.diameter == 2.5
 

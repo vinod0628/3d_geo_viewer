@@ -13,7 +13,7 @@ import math
 import numpy as np
 from PySide6.QtCore import QDate, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QDateEdit, QDialog, QDoubleSpinBox, QFormLayout, QGridLayout,
+from PySide6.QtWidgets import (QComboBox, QDateEdit, QDialog, QDoubleSpinBox, QFormLayout, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
                                QSizePolicy, QVBoxLayout, QWidget)
 
@@ -293,6 +293,25 @@ class MinedShapeDialog(QDialog):
         for b in (self.b_bottom, self.b_top, self.b_next):
             quick.addWidget(b)
         form.addRow(quick)
+        # AI: the best From / To of this thickness under the outline
+        self.c_aim = QComboBox()
+        for key, text in (("metal", tr("most metal")), ("grade", tr("highest grade")), ("tonnes", tr("most ore"))):
+            self.c_aim.addItem(text, key)
+        self.c_aim.setToolTip(tr("What the suggestion looks for: the levels with the most metal, the highest grade, "
+                                 "or the most ore (keeping the thickness)"))
+        self.b_suggest = self._btn("creation", tr("Suggest best levels"),
+                                   tr("Find the From / To of this thickness under the outline that gives the most "
+                                      "(ore not mined yet only); you can change them afterwards"), self.suggest)
+        aim = QHBoxLayout()
+        aim.addWidget(self.b_suggest)
+        aim.addWidget(QLabel(tr("for")))
+        aim.addWidget(self.c_aim, 1)
+        form.addRow(aim)
+        self.ai_note = QLabel()
+        self.ai_note.setWordWrap(True)
+        self.ai_note.setStyleSheet("color: #7fb8ff;")
+        self.ai_note.setVisible(False)
+        form.addRow(self.ai_note)
         form.addRow(tr("Note"), self.note)
 
         # --- figures ------------------------------------------------------------
@@ -446,6 +465,31 @@ class MinedShapeDialog(QDialog):
             self._set(a, b)
         else:
             self.shape.from_, self.shape.to = a, b
+
+    def suggest(self) -> None:
+        """Set From / To to the best window of the current thickness (AI suggestion, explained)."""
+        from ..ai.reserve_advisor import suggest_levels
+
+        if self.dep is None:
+            return
+        t = abs(self.s_thick.value()) or self._thickness()
+        before = self.dep.preview(self.current())["new"]
+        sug = suggest_levels(self.dep, self.current(), t, self.c_aim.currentData())
+        self.ai_note.setVisible(True)
+        if not sug.ok:
+            self.ai_note.setText("✦ " + sug.message)
+            return
+        a, b = sug.from_, sug.to
+        self._set(a, b)
+        gain = ""
+        if before.metal > 0 and sug.metal > before.metal * 1.005:
+            gain = " " + tr("That is {p:.0%} more metal than the levels you had.", p=sug.metal / before.metal - 1)
+        alts = "; ".join(tr("{a:,.1f} → {b:,.1f}: {t:,.0f} t @ {g:,.2f}", a=x, b=y, t=tt, g=mm / tt if tt else 0)
+                         for x, y, tt, mm in sug.alternatives)
+        self.ai_note.setText("✦ " + tr("Suggested {a:,.1f} → {b:,.1f} ({ax}): {t:,.0f} t of ore not mined yet at "
+                                       "{g:,.2f} {unit}.", a=a, b=b, ax=self.ax, t=sug.tonnes, g=sug.grade,
+                                       unit=self.unit) + gain
+                             + (("  " + tr("Next best: {alts}.", alts=alts)) if alts else ""))
 
     # --- linked fields ---------------------------------------------------------------
     def _set(self, a: float, b: float) -> None:

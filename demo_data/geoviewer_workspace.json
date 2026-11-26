@@ -2,26 +2,26 @@
   "format": "GeoViewer workspace",
   "version": 1,
   "app_version": "0.1.0",
-  "saved": "2026-11-23T16:18:16",
+  "saved": "2026-11-26T17:58:05",
   "view": {
     "mode": "3d",
     "grid": true,
     "focal_point": [
-      1640.386588955185,
-      7201.267349489378,
-      -150.378004678561
+      1702.0,
+      7360.0,
+      122.0
     ],
     "position": [
-      1684.0169025044647,
-      7524.140575624526,
-      806.6321982098932
+      1712.75041253142,
+      6756.0422041084585,
+      666.5301867005819
     ],
     "view_up": [
-      0.11571367368095943,
-      -0.9427486801686081,
-      0.3127863036700996
+      0.02812068607800713,
+      0.669633496638567,
+      0.7421591521999232
     ],
-    "parallel_scale": 316.6001668878537,
+    "parallel_scale": 372.89140510341616,
     "perspective": true
   },
   "layers": [
@@ -146,39 +146,6 @@
       }
     },
     {
-      "name": "block_model",
-      "type": "BlockModelLayer",
-      "part": "",
-      "files": [
-        "block_model.csv"
-      ],
-      "settings": {
-        "visible": true,
-        "opacity": 1.0,
-        "color": [
-          0.96,
-          0.62,
-          0.2
-        ],
-        "color_by": "gold",
-        "cmap": "jet",
-        "hide_null": true,
-        "value_min": null,
-        "value_max": null,
-        "clim": null,
-        "show_edges": false,
-        "constraints": [
-          {
-            "kind": "dtm",
-            "layer": "ore1",
-            "mode": "inside"
-          }
-        ],
-        "constraint_logic": "and",
-        "mined_display": "gray"
-      }
-    },
-    {
       "name": "Drillholes (database)",
       "type": "DrillholeLayer",
       "part": "",
@@ -232,7 +199,8 @@
             0.2,
             0.5450980392156862
           ]
-        }
+        },
+        "area": "auto"
       },
       "source": "database"
     },
@@ -251,6 +219,7 @@
         ],
         "show_drives": true,
         "show_labels": false,
+        "show_designs": true,
         "pit_styles": {
           "4": {
             "visible": true
@@ -275,10 +244,89 @@
           },
           "8": {
             "color": null
+          },
+          "d1": {
+            "visible": true,
+            "centerline": false,
+            "color": [
+              0.2549019753932953,
+              0.29019609093666077,
+              0.2705882489681244
+            ]
           }
-        }
+        },
+        "show_geology": true,
+        "show_structures": true,
+        "show_samples": true,
+        "structure_size": 1.0
       },
       "source": "database"
+    },
+    {
+      "name": "ore1_bm",
+      "type": "BlockModelLayer",
+      "part": "",
+      "files": [
+        "ore1_bm.gvbm"
+      ],
+      "settings": {
+        "visible": false,
+        "opacity": 1.0,
+        "color": [
+          0.65,
+          0.65,
+          0.65
+        ],
+        "color_by": "gold",
+        "cmap": "jet",
+        "hide_null": true,
+        "value_min": 0.1,
+        "value_max": null,
+        "clim": null,
+        "show_edges": false,
+        "constraints": [
+          {
+            "kind": "dtm",
+            "layer": "ore1",
+            "mode": "inside"
+          }
+        ],
+        "constraint_logic": "and",
+        "mined_display": "gray"
+      }
+    },
+    {
+      "name": "block_model",
+      "type": "BlockModelLayer",
+      "part": "",
+      "files": [
+        "block_model.gvbm"
+      ],
+      "settings": {
+        "visible": true,
+        "opacity": 1.0,
+        "color": [
+          0.6,
+          0.8,
+          0.25
+        ],
+        "color_by": "gold",
+        "cmap": "jet",
+        "hide_null": true,
+        "value_min": 0.01,
+        "value_max": 9.789,
+        "clim": null,
+        "show_edges": false,
+        "constraints": [
+          {
+            "kind": "dtm",
+            "layer": "ore1",
+            "mode": "inside"
+          }
+        ],
+        "constraint_logic": "and",
+        "mined_display": "gray"
+      }
     }
   ],
   "app_layers": {
@@ -299,6 +347,7 @@
     "all_pits.dtm",
     "all_pits.str",
     "block_model.csv",
+    "block_model.gvbm",
     "fault1.dtm",
     "fault1.str",
     "geoviewer.sqlite",
@@ -307,6 +356,7 @@
     "layout2.str",
     "ore1.dtm",
     "ore1.str",
+    "ore1_bm.gvbm",
     "pit1.dtm",
     "pit1.str",
     "rings12.str",

@@ -2,7 +2,9 @@
 line swept with its rectangular profile), the centre lines and the stations.
 
 The drives are made from the survey tables, not from files: whenever a station or a setup
-changes, the layer is read again and the drives follow.
+changes, the layer is read again and the drives follow. The geology mapped in the pits (rocks on
+the walls and the back, structures as discs tilted to their dip, samples as narrow bands; see
+scene/pit_geology.py) is drawn on the drives.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ FAMILY_COLORS = [(0.95, 0.62, 0.22), (0.35, 0.70, 0.95), (0.50, 0.82, 0.42), (0.
 STATUS_COLORS = {"known": (0.25, 0.55, 1.0), "entered": (0.72, 0.55, 1.0), "closed": (0.35, 0.85, 0.40),
                  "open": (0.98, 0.80, 0.25), "failed": (0.95, 0.30, 0.30), "unresolved": (0.60, 0.60, 0.60)}
 PIT_STYLE_DEFAULTS = {"visible": True, "color": None, "centerline": True, "stations": True}
+DESIGN_COLOR = (0.30, 0.90, 0.45)           # designed pits (route designer): green, as in its preview
+DESIGN_STYLE_DEFAULTS = {"visible": True, "color": None, "centerline": True}
 STATUS_TEXT = {"known": N_("known (entered)"), "entered": N_("coordinates given (already calculated)"),
                "closed": N_("computed, traverse closed"), "open": N_("computed, not checked"),
                "failed": N_("computed, closure failed"), "unresolved": N_("no coordinates yet")}   # shown: tr(text)
@@ -38,9 +42,16 @@ class SurveyData:
     paths: dict                             # pit id -> [[station, station, ...], ...]
     source: str = ""
     warnings: list = field(default_factory=list)
+    designs: list = field(default_factory=list)  # survey_store.DesignPit: drives designed, not surveyed
+    geology: dict = field(default_factory=dict)  # pit id -> pit_geology_store.PitGeology (mapped geology)
+    rock_colors: dict = field(default_factory=dict)  # rock code -> "#rrggbb" (drillhole_styles)
+    assay_fields: list = field(default_factory=list)  # the pit samples' assay fields
 
     def pit(self, pid):
         return next((p for p in self.pits if p.id == pid), None)
+
+    def design(self, did):
+        return next((d for d in self.designs if d.id == did), None)
 
     def family(self, pid) -> int:
         """Index of the main pit a pit belongs to (its branches share the main pit's colour)."""
@@ -76,6 +87,15 @@ class SurveyData:
     def xyz(self, name):
         s = self.stations.get(name)
         return None if s is None or None in (s.x, s.y, s.z) else np.array([s.x, s.y, s.z], dtype=np.float64)
+
+
+def hex_rgb(color: str, default=(0.6, 0.6, 0.6)) -> tuple:
+    """"#rrggbb" -> (r, g, b) in 0..1 (``default`` when it is not one)."""
+    h = str(color or "").strip().lstrip("#")
+    try:
+        return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)) if len(h) == 6 else default
+    except ValueError:
+        return default
 
 
 def pit_paths(setups: dict) -> dict:
@@ -250,6 +270,41 @@ def pit_drives(data: "SurveyData", pit, origin=None) -> list:
     return out
 
 
+def _drives_volume(data: "SurveyData", pit) -> float:
+    """Volume (m³) of a pit's drives: the closed tubes as drawn (cross-section x length where a tube is
+    not closed)."""
+    if pit is None:
+        return 0.0
+    first = next((x for path in data.paths.get(pit.id, []) for x in (data.xyz(n) for n in path) if x is not None),
+                 None)                                # local coordinates: no precision lost far from 0
+    total = 0.0
+    for P, V, Q in pit_drives(data, pit, first):
+        mesh = pv.PolyData(np.asarray(V, np.float64), faces=np.hstack([np.full((len(Q), 1), 4), Q]).ravel())
+        mesh = mesh.triangulate().clean()
+        if mesh.n_cells and mesh.n_open_edges == 0:
+            total += abs(float(mesh.volume))
+        else:
+            total += pit.profile_width * pit.profile_height * float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
+    return total
+
+
+def _tube_volume(V, Q, fallback: float) -> float:
+    mesh = pv.PolyData(np.asarray(V, np.float64), faces=np.hstack([np.full((len(Q), 1), 4), Q]).ravel())
+    mesh = mesh.triangulate().clean()
+    return abs(float(mesh.volume)) if mesh.n_cells and mesh.n_open_edges == 0 else fallback
+
+
+def design_volume(d) -> float:
+    """Volume (m³) of a designed pit's drive (the closed tube along its centre line)."""
+    P = np.asarray(d.points, np.float64)
+    if len(P) < 2:
+        return 0.0
+    P = P - P[0]
+    V, Q = drive_mesh(P, d.profile_width, d.profile_height, d.station_level)
+    return _tube_volume(V, Q, d.profile_width * d.profile_height * float(np.linalg.norm(np.diff(P, axis=0),
+                                                                                       axis=1).sum()))
+
+
 def drive_mesh(points: np.ndarray, width: float, height: float, level: str = "back", start_walls=None,
                end_walls=None):
     """A closed rectangular tube along ``points`` (K, 3): walls vertical, ``width`` x ``height``,
@@ -315,11 +370,18 @@ class SurveyLayer(Layer):
     opacity: float = 0.55
     show_drives: bool = True
     show_labels: bool = True
+    show_designs: bool = True                       # the "Designed Pits" group switched on
+    show_geology: bool = True                       # mapped rocks on the walls and the back
+    show_structures: bool = True                    # mapped structures (discs tilted to their dip)
+    show_samples: bool = True                       # pit samples (narrow bands on the walls)
+    structure_size: float = 1.0                     # m: radius of a structure's disc
     # per pit (key: pit id as text): visible, color (None = the parent's / the main pit's
-    # default), and for main pits centerline / stations (for the main pit and its branches)
+    # default), and for main pits centerline / stations (for the main pit and its branches);
+    # per designed pit (key "d" + its id): visible, color (None = DESIGN_COLOR), centerline
     pit_styles: dict = field(default_factory=dict)
 
-    SETTINGS = Layer.SETTINGS + ("show_drives", "show_labels", "pit_styles")
+    SETTINGS = Layer.SETTINGS + ("show_drives", "show_labels", "show_designs", "pit_styles", "show_geology",
+                                 "show_structures", "show_samples", "structure_size")
 
     def _dict_setting(self, key, value):
         if key != "pit_styles":
@@ -380,8 +442,70 @@ class SurveyLayer(Layer):
                 return c
         return FAMILY_COLORS[d.family(pid) % len(FAMILY_COLORS)]
 
-    def pit_bounds(self, pid):
-        """World bounds of a pit and its branches (None without coordinates)."""
+    # --- designed pits ------------------------------------------------------------------
+    def design_style(self, did) -> dict:
+        st = dict(DESIGN_STYLE_DEFAULTS)
+        saved = self.pit_styles.get(f"d{did}")
+        if isinstance(saved, dict):
+            st.update({k: saved[k] for k in DESIGN_STYLE_DEFAULTS if k in saved})
+        if st["color"] is not None:
+            try:
+                st["color"] = tuple(float(x) for x in st["color"])[:3]
+            except (TypeError, ValueError):
+                st["color"] = None
+        return st
+
+    def set_design_style(self, did, **kw) -> None:
+        st = dict(self.pit_styles.get(f"d{did}") or {})
+        for k, v in kw.items():
+            if k in DESIGN_STYLE_DEFAULTS:
+                st[k] = list(v) if k == "color" and v is not None else v
+        self.pit_styles[f"d{did}"] = st
+        if self.scene is not None:
+            self.rebuild()
+
+    def set_designs_centerline(self, on: bool) -> None:
+        """The centre lines of all designed pits on / off."""
+        for x in (self.data.designs if self.data is not None else []):
+            st = dict(self.pit_styles.get(f"d{x.id}") or {})
+            st["centerline"] = bool(on)
+            self.pit_styles[f"d{x.id}"] = st
+        if self.scene is not None:
+            self.rebuild()
+
+    def set_show_designs(self, on: bool) -> None:
+        self.show_designs = bool(on)
+        if self.scene is not None:
+            self.rebuild()
+
+    def design_shown(self, did) -> bool:
+        return self.show_designs and self.design_style(did)["visible"]
+
+    def design_color(self, did) -> tuple:
+        return self.design_style(did)["color"] or DESIGN_COLOR
+
+    def design_volume(self, did) -> float:
+        d = self.data.design(did) if self.data is not None else None
+        if d is None:
+            return 0.0
+        cache = self.data.__dict__.setdefault("_volumes", {})
+        if ("d", did) not in cache:
+            cache[("d", did)] = design_volume(d)
+        return cache[("d", did)]
+
+    def design_bounds(self, did=None):
+        """World bounds of a designed pit (None: of all of them); None without points."""
+        d = self.data
+        ds = [x for x in (d.designs if d is not None else []) if did is None or x.id == did]
+        pts = [p for x in ds for p in x.points]
+        if not pts:
+            return None
+        a = np.asarray(pts, float)
+        pad = max(max(x.profile_width, x.profile_height) for x in ds)
+        return a.min(axis=0) - pad, a.max(axis=0) + pad
+
+    def pit_family(self, pid) -> set:
+        """The pit and all its branches (and theirs)."""
         d = self.data
         ids, todo = set(), [pid]
         while todo:
@@ -389,6 +513,27 @@ class SurveyLayer(Layer):
             if q not in ids:
                 ids.add(q)
                 todo += [c.id for c in d.children(q)]
+        return ids
+
+    def pit_volume(self, pid, branches: bool = False) -> float:
+        """Excavated volume (m³) of the pit's drives as drawn - a branch counted from where it leaves its
+        parent's wall, so junctions are not counted twice; with ``branches`` also all its branches."""
+        d = self.data
+        if d is None:
+            return 0.0
+        cache = d.__dict__.setdefault("_volumes", {})
+        ids = self.pit_family(pid) if branches else {pid}
+        total = 0.0
+        for q in ids:
+            if q not in cache:
+                cache[q] = _drives_volume(d, d.pit(q))
+            total += cache[q]
+        return total
+
+    def pit_bounds(self, pid):
+        """World bounds of a pit and its branches (None without coordinates)."""
+        d = self.data
+        ids = self.pit_family(pid)
         pts = [d.xyz(n) for q in ids for path in d.paths.get(q, []) for n in path]
         pts = [x for x in pts if x is not None]
         if not pts:
@@ -401,6 +546,90 @@ class SurveyLayer(Layer):
     @property
     def removable(self) -> bool:                    # comes from the database: hide it instead
         return False
+
+    def set_opacity(self, v: float) -> None:
+        """The drives' opacity (the mapped geology stays solid)."""
+        self.opacity = float(v)
+        for a in self.actors:
+            if not getattr(a, "_geoviewer_solid", False):
+                a.GetProperty().SetOpacity(self.opacity)
+
+    # --- mapped geology ----------------------------------------------------------------------
+    def rock_rgb(self, code: str) -> tuple:
+        """A rock's colour: drillhole_styles, else a palette colour by the code's place."""
+        from .layers import PALETTE
+
+        d = self.data
+        c = (d.rock_colors or {}).get(code) if d is not None else None
+        if c:
+            return hex_rgb(c)
+        codes = sorted({r.rock for g in (d.geology.values() if d else []) for r in g.intervals}
+                       - set((d.rock_colors or {}) if d else ()))
+        return PALETTE[codes.index(code) % len(PALETTE)] if code in codes else (0.6, 0.6, 0.6)
+
+    def axis(self, pid):
+        """The pit's chainage axis (cached until the data change); None without two stations."""
+        from .pit_geology import pit_axis
+
+        d = self.data
+        cache = d.__dict__.setdefault("_axes", {})
+        if pid not in cache:
+            cache[pid] = pit_axis(d, pid)
+        return cache[pid]
+
+    def _build_geology(self, o) -> None:
+        from ..io.pit_geology_store import STRUCTURE_COLORS
+        from .pit_geology import interval_bands, sample_ribbon, structure_disc
+
+        d = self.data
+        self._geo_items = []
+        parts = {"rocks": ([], [], [], []), "structures": ([], [], [], []), "samples": ([], [], [], [])}
+
+        def put(kind, V, F, item, rgb):
+            verts, faces, ids, cols = parts[kind]
+            base = sum(len(v) for v in verts)
+            verts.append(V - o)
+            faces.append(F + base)
+            ids += [len(self._geo_items)] * len(F)
+            cols += [_to_u8(rgb)] * len(F)
+
+        sample_rgb = hex_rgb("#1de9b6")
+        for pid, geo in sorted(d.geology.items()):
+            if d.pit(pid) is None or not self.pit_shown(pid):
+                continue
+            ax = self.axis(pid)
+            if ax is None:
+                continue
+            if self.show_geology:
+                for i, r in enumerate(geo.intervals):
+                    bands = interval_bands(ax, r)
+                    if bands:
+                        for _w, V, F in bands:
+                            put("rocks", V, F, None, self.rock_rgb(r.rock))
+                        self._geo_items.append(("interval", pid, i))
+            if self.show_structures:
+                for i, s in enumerate(geo.structures):
+                    got = structure_disc(ax, s, max(float(self.structure_size), 0.05))
+                    if got is not None:
+                        put("structures", *got, None, hex_rgb(STRUCTURE_COLORS.get(s.kind, "#b0b6bd")))
+                        self._geo_items.append(("structure", pid, i))
+            if self.show_samples:
+                for i, s in enumerate(geo.samples):
+                    got = sample_ribbon(ax, s)
+                    if got is not None:
+                        put("samples", *got, None, sample_rgb)
+                        self._geo_items.append(("sample", pid, i))
+        for kind, (verts, faces, ids, cols) in parts.items():
+            if not verts:
+                continue
+            F = np.vstack(faces)
+            n = F.shape[1]
+            mesh = pv.PolyData(np.vstack(verts).astype(np.float64), faces=np.hstack([np.full((len(F), 1), n), F]).ravel())
+            mesh.cell_data["geo"] = np.asarray(ids, dtype=np.int64)
+            mesh.cell_data["rgb"] = np.asarray(cols, dtype=np.uint8)
+            act = self._add(mesh, scalars="rgb", rgb=True, show_edges=False, ambient=0.35,
+                            lighting=kind != "samples")
+            act._geoviewer_solid = True
 
     def _build_actors(self) -> None:
         d = self.data
@@ -442,6 +671,10 @@ class SurveyLayer(Layer):
             lines.cell_data["pit"] = np.asarray(l_pit, dtype=np.int64)
             lines.cell_data["rgb"] = np.asarray(l_rgb, dtype=np.uint8)
             self._add(lines, scalars="rgb", rgb=True, line_width=2.5, lighting=False)
+        self._build_designs(o)
+        if d.geology:
+            self._build_geology(o)
+
         def station_shown(s):
             pid = s.pit_id if d.pit(s.pit_id) is not None else None
             if pid is None:
@@ -464,10 +697,47 @@ class SurveyLayer(Layer):
                 act._geoviewer_layer = self
                 self.actors.append(act)
 
+    def _build_designs(self, o) -> None:
+        """The designed pits: their drives (the same see-through look as the surveyed ones) and centre lines."""
+        verts, quads, q_id, q_rgb = [], [], [], []
+        line_pts, line_cells, l_id, l_rgb = [], [], [], []
+        base = lbase = 0
+        for d in self.data.designs:
+            if len(d.points) < 2 or not self.design_shown(d.id):
+                continue
+            P = np.asarray(d.points, np.float64) - o
+            rgb = _to_u8(self.design_color(d.id))
+            if self.show_drives:
+                V, Q = drive_mesh(P, d.profile_width, d.profile_height, d.station_level)
+                verts.append(V)
+                quads.append(Q + base)
+                base += len(V)
+                q_id += [d.id] * len(Q)
+                q_rgb += [rgb] * len(Q)
+            if not self.design_style(d.id)["centerline"]:
+                continue
+            line_pts.append(P)
+            line_cells.append(np.r_[len(P), np.arange(lbase, lbase + len(P))])
+            lbase += len(P)
+            l_id.append(d.id)
+            l_rgb.append(rgb)
+        if verts:
+            Q = np.vstack(quads)
+            mesh = pv.PolyData(np.vstack(verts), faces=np.hstack([np.full((len(Q), 1), 4), Q]).ravel())
+            mesh.cell_data["design"] = np.asarray(q_id, dtype=np.int64)
+            mesh.cell_data["rgb"] = np.asarray(q_rgb, dtype=np.uint8)
+            self._add(mesh, scalars="rgb", rgb=True, opacity=self.opacity, show_edges=False, ambient=0.25)
+        if line_pts:
+            lines = pv.PolyData(np.vstack(line_pts).astype(np.float32), lines=np.concatenate(line_cells))
+            lines.cell_data["design"] = np.asarray(l_id, dtype=np.int64)
+            lines.cell_data["rgb"] = np.asarray(l_rgb, dtype=np.uint8)
+            self._add(lines, scalars="rgb", rgb=True, line_width=2.5, lighting=False)
+
     def world_bounds(self):
         d = self.data
         pts = [d.xyz(n) for n in d.stations] if d is not None else []
-        pts = [p for p in pts if p is not None]
+        pts = [p for p in pts if p is not None] + ([np.asarray(q, float) for x in d.designs for q in x.points]
+                                                   if d is not None else [])
         if not pts:
             return None
         a = np.array(pts)
@@ -476,12 +746,15 @@ class SurveyLayer(Layer):
 
     def info(self):
         d = self.data
-        if d is None or not d.pits:
-            return super().info() + [(tr("Pits"), tr("none yet - add them with Survey (Ctrl+U)"))]
+        if d is None or (not d.pits and not d.designs):
+            return super().info() + [(tr("Pits"), tr("none yet - add them with the Pit Manager (Ctrl+U)"))]
         mains = sum(1 for p in d.pits if p.parent_id is None)
         known = sum(1 for s in d.stations.values() if s.status == "known")
-        return super().info() + [(tr("Main pits"), f"{mains:,}"), (tr("Branches"), f"{len(d.pits) - mains:,}"),
+        rows = super().info() + [(tr("Main pits"), f"{mains:,}"), (tr("Branches"), f"{len(d.pits) - mains:,}"),
                                  (tr("Stations"), tr("{n:,} ({known} known)", n=len(d.stations), known=known))]
+        if d.designs:
+            rows.append((tr("Designed pits"), f"{len(d.designs):,}"))
+        return rows
 
     def pit_length(self, pid) -> float:
         d = self.data
@@ -495,6 +768,15 @@ class SurveyLayer(Layer):
     def identify(self, hit):
         d = self.data
         mesh = hit.mesh
+        if "geo" in mesh.cell_data and getattr(self, "_geo_items", None):
+            k = int(hit.cell_value("geo"))
+            if 0 <= k < len(self._geo_items):
+                from .pit_geology import geology_identify
+
+                got = geology_identify(self, *self._geo_items[k])
+                if got is not None:
+                    title, rows = got
+                    return IdentifyResult(title, rows + self._picked_rows(hit))
         if "station" in mesh.cell_data and getattr(self, "_station_names", None):
             name = self._station_names[int(hit.cell_value("station"))]
             s = d.stations[name]
@@ -506,6 +788,11 @@ class SurveyLayer(Layer):
             if s.note:
                 rows.append((tr("Note"), s.note))
             return IdentifyResult(tr("Station {name}", name=name), rows, marker=self.scene.to_local(np.array([s.x, s.y, s.z])))
+        if "design" in mesh.cell_data:
+            x = d.design(int(hit.cell_value("design")))
+            if x is not None:
+                rows = design_rows(self, x) + self._picked_rows(hit)
+                return IdentifyResult(tr("Designed pit {name}", name=x.name), rows)
         if "pit" in mesh.cell_data:
             p = d.pit(int(hit.cell_value("pit")))
             if p is not None:
@@ -520,3 +807,29 @@ class SurveyLayer(Layer):
                 rows += self._picked_rows(hit)
                 return IdentifyResult(tr("Pit {name}", name=p.name), rows)
         return super().identify(hit)
+
+
+def design_rows(layer: SurveyLayer, x) -> list:
+    """(label, text) rows describing a designed pit."""
+    d = layer.data
+    pit = d.pit(x.start_pit_id) if x.start_pit_id is not None else None
+    rows = [(tr("Designed pit"), x.name)]
+    rows.append((tr("Starts at"), (x.start_name or "-") + (f"  ({pit.name})" if pit is not None else "")))
+    rows.append((tr("Goes to"), x.target_name or "-"))
+    rows.append((tr("Length"), f"{x.length:,.1f} m"))
+    rows.append((tr("Height change"), f"{x.climb:+,.1f} m"))
+    if x.steepest is not None:
+        from ..ai.route_planner import ratio_text
+
+        rows.append((tr("Steepest part"), ratio_text(x.steepest)))
+        if x.gradient:
+            rows.append((tr("Steepest gradient allowed"), ratio_text(x.gradient)))
+    rows.append((tr("Legs"), f"{max(len(x.points) - 1, 0):,}"))
+    rows.append((tr("Profile"), tr(PROFILE_TEXT.get(x.station_level, PROFILE_TEXT["middle"]), w=x.profile_width,
+                                   h=x.profile_height)))
+    rows.append((tr("Volume"), tr("{v:,.0f} m³", v=layer.design_volume(x.id))))
+    if x.created_at:
+        rows.append((tr("Saved"), x.created_at.replace("T", " ")))
+    if x.note:
+        rows.append((tr("Note"), x.note))
+    return rows

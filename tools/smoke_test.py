@@ -1,7 +1,7 @@
 """Headless smoke test of the installed environment (no window is shown).
 
 Checks: every runtime package imports, VTK can render with OpenGL off-screen,
-Qt widgets work (offscreen platform), and - when surpac_demo\ is present -
+Qt widgets work (offscreen platform), and - when demo_data\ is present -
 the demo files load into layers.
 
 Exit code 0 = OK, 1 = failure. Run with the .venv interpreter.
@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-DEMO = ROOT / "surpac_demo"
-DEMO_FILES = ["topo1.dtm", "ore1.dtm", "pit1.str", "topo2.dxf", "block_model.csv", "surpac.accdb"]
+DEMO = ROOT / "demo_data"
+DEMO_FILES = ["topo1.dtm", "ore1.dtm", "pit1.str", "topo2.dxf", "ore1_bm.gvbm"]
 
 
 def step(name, fn):
@@ -86,7 +86,7 @@ def qt_widgets():
 
 def demo_data():
     if not DEMO.exists():
-        return "skipped (no surpac_demo folder)"
+        return "skipped (no demo_data folder)"
     from geoviewer.scene.loaders import load_paths
 
     files = [DEMO / f for f in DEMO_FILES if (DEMO / f).exists()]

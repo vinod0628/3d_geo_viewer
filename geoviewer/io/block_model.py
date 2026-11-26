@@ -11,13 +11,13 @@ ignored). Numeric attributes are stored as float32 to keep memory down on
 models with tens of millions of blocks. Text attributes are stored as int32
 codes with a category list.
 
-The first read of a CSV saves a binary cache (.npz) so later loads skip CSV
-parsing; see ``geoviewer.io.cache``.
+The first read of a CSV saves a binary cache so later loads skip CSV parsing; see
+``geoviewer.io.cache``. The cache is written in the encrypted block model format
+(``geoviewer.blockmodel.store``), never as plain arrays: block values are sensitive data.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,7 +29,8 @@ from ..i18n import tr
 from .cache import cache_path_for
 
 SURPAC_NULL = -99.0
-_CACHE_KIND = "blockmodel-v1"
+_CACHE_KIND = "blockmodel-v2"            # v1 was a plain .npz (removed when seen)
+_OLD_CACHE_KIND = "blockmodel-v1"
 
 _CENTROID = {
     0: {"x", "xc", "xcentre", "xcenter", "xcentroid", "centroidx", "east", "easting", "xcen"},
@@ -67,6 +68,8 @@ class BlockModel:
     null_value: float = SURPAC_NULL
     # fixed colours of some text attributes (e.g. the computed mined "status"): name -> [rgb, ...]
     category_rgb: dict = field(default_factory=dict)
+    # managed block models (.gvbm): name, attribute descriptions, history, ... (see blockmodel.store)
+    info: dict = field(default_factory=dict)
 
     @property
     def n_blocks(self) -> int:
@@ -151,30 +154,40 @@ def _from_dataframe(df: pd.DataFrame, path: Path | None, null_value: float) -> B
 
 
 def _save_cache(bm: BlockModel, cpath: Path) -> None:
-    arrays = {"centroids": bm.centroids, "sizes": bm.sizes}
-    names = list(bm.attributes)
-    for i, n in enumerate(names):
-        arrays[f"attr_{i}"] = bm.attributes[n]
-    meta = {"names": names, "categories": bm.categories, "null_value": bm.null_value}
-    arrays["meta"] = np.array(json.dumps(meta))
-    cpath.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cpath.with_name(cpath.name + ".tmp.npz")
-    np.savez(tmp, **arrays)
-    tmp.replace(cpath)
+    from ..blockmodel.store import save_block_model
+
+    save_block_model(bm, cpath)
 
 
 def _load_cache(cpath: Path, path: Path) -> BlockModel:
-    with np.load(cpath, allow_pickle=False) as z:
-        meta = json.loads(str(z["meta"]))
-        attrs = {n: z[f"attr_{i}"] for i, n in enumerate(meta["names"])}
-        return BlockModel(
-            path=path,
-            centroids=z["centroids"],
-            sizes=z["sizes"],
-            attributes=attrs,
-            categories=meta["categories"],
-            null_value=meta["null_value"],
-        )
+    from ..blockmodel.store import read_block_model
+
+    bm = read_block_model(cpath)
+    bm.path = path
+    bm.info = {}
+    return bm
+
+
+def _drop_plain_cache(path: Path, cache_dir) -> None:
+    """Remove the plain .npz cache earlier versions wrote for ``path``."""
+    try:
+        cache_path_for(path, _OLD_CACHE_KIND, cache_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def drop_csv_cache(path: str | Path, cache_dir: str | Path | None = None) -> None:
+    """Remove the caches kept for a block model CSV (e.g. once the CSV is deleted)."""
+    try:                                  # the cache name is keyed on the file: call before deleting it
+        paths = (cache_path_for(path, _CACHE_KIND, cache_dir).with_suffix(".gvbm"),
+                 cache_path_for(path, _OLD_CACHE_KIND, cache_dir))
+    except OSError:
+        return
+    for p in paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_block_csv(
@@ -184,7 +197,9 @@ def read_block_csv(
     cache_dir: str | Path | None = None,
 ) -> BlockModel:
     path = Path(path)
-    cpath = cache_path_for(path, _CACHE_KIND, cache_dir) if use_cache else None
+    cpath = cache_path_for(path, _CACHE_KIND, cache_dir).with_suffix(".gvbm") if use_cache else None
+    if use_cache:
+        _drop_plain_cache(path, cache_dir)
     if cpath is not None and cpath.exists():
         try:
             return _load_cache(cpath, path)

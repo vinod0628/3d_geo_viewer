@@ -2,15 +2,18 @@
 rem ===========================================================================
 rem  GeoViewer - offline environment installer (Windows x64)
 rem
-rem  Creates .venv (Python 3.10) in this folder from the local wheels in whl\,
-rem  with NO internet access:
+rem  Creates .venv (Python 3.10) in this folder from the shared wheel store
+rem  E:\python_packages\, with NO internet access:
 rem    1. Python 3.10      - uses an existing install, else installs
-rem                          whl\runtime\python-3.10.11-amd64.exe (current user)
-rem    2. VC++ runtime     - installs whl\runtime\vc_redist.x64.exe only if
+rem                          E:\python_packages\runtime\python-3.10.11-amd64.exe (current user)
+rem    2. VC++ runtime     - installs E:\python_packages\runtime\vc_redist.x64.exe only if
 rem                          msvcp140_1.dll is missing (needs admin)
-rem    3. .venv            - python -m venv, then pip install --no-index from whl\
+rem    3. .venv            - python -m venv, then pip install --no-index from E:\python_packages\
 rem                          exactly the versions in requirements-offline.txt
 rem    4. checks           - tools\pip_check.py, tools\smoke_test.py, unit tests
+rem
+rem  The wheel store is shared by all projects. To use another location:
+rem           set PYTHON_PACKAGES=D:\other\python_packages
 rem
 rem  Usage:   install_env.bat            install / repair
 rem           install_env.bat /clean     delete .venv first, then install
@@ -19,7 +22,9 @@ rem ===========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
 set "ROOT=%~dp0"
-set "WHL=%ROOT%whl"
+rem shared offline wheel store (common to all projects); override with the PYTHON_PACKAGES variable
+if not defined PYTHON_PACKAGES set "PYTHON_PACKAGES=E:\python_packages"
+set "WHL=%PYTHON_PACKAGES%"
 set "RT=%WHL%\runtime"
 set "VENV=%ROOT%.venv"
 set "VPY=%VENV%\Scripts\python.exe"
@@ -30,7 +35,7 @@ set "PYTHONUTF8=1"
 if /i "%~1"=="/test" goto :checks
 
 if not exist "%WHL%\vtk-*.whl" (
-  echo [ERROR] whl\ folder is missing or incomplete: %WHL%
+  echo [ERROR] shared wheel folder is missing or incomplete: %WHL%
   goto :fail
 )
 if not exist "%REQ%" (
@@ -52,7 +57,7 @@ for /f "delims=" %%P in ('py -3.10 -c "import sys; print(sys.executable)" 2^>nul
 if defined PY goto :have_py
 if not defined PY (
   if not exist "%RT%\python-3.10.11-amd64.exe" (
-    echo [ERROR] Python 3.10 not found and whl\runtime\python-3.10.11-amd64.exe is missing.
+    echo [ERROR] Python 3.10 not found and %RT%\python-3.10.11-amd64.exe is missing.
     goto :fail
   )
   echo       not found - installing Python 3.10.11 for the current user ...
@@ -78,7 +83,7 @@ if exist "%SystemRoot%\System32\msvcp140_1.dll" (
 
 rem ---------------------------------------------------------------- 3. venv + wheels
 echo.
-echo [3/4] virtual environment %VENV% + packages ^(offline, from whl\^)
+echo [3/4] virtual environment %VENV% + packages ^(offline, from %WHL%^)
 if /i "%~1"=="/clean" if exist "%VENV%\pyvenv.cfg" (
   echo       /clean: removing existing .venv ...
   rmdir /s /q "%VENV%"

@@ -135,6 +135,20 @@ def available_languages() -> list[Language]:
     return [ENGLISH] + sorted(out, key=lambda lang: lang.english_name or lang.name)
 
 
+def every_translation(text: str) -> set[str]:
+    """``text`` and its translation in every language file - for reading back a value a user
+    typed in any language (e.g. a hole state in an Excel sheet made while Chinese was on)."""
+    out = {text}
+    for p in sorted(LOCALE_DIR.glob("*.json")):
+        try:
+            v = _read(p)[1].get(text)
+        except (OSError, ValueError):
+            continue
+        if isinstance(v, str) and v:
+            out.add(v)
+    return out
+
+
 def match_language(code: str | None) -> str:
     """The available language for ``code`` ("zh_CN", "zh-CN", "zh" ...), else English."""
     if not code:

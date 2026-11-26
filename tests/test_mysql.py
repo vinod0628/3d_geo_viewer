@@ -36,13 +36,13 @@ def test_check_connection(mysql):
     assert text.startswith("Connected to MySQL 8") and "no GeoViewer tables yet" in text
 
 
-def test_drillholes_on_mysql(mysql, accdb, tmp_path):
+def test_drillholes_on_mysql(mysql, surpac_sqlite, tmp_path):
     """drillhole_ tables imported into MySQL (here written with write_frame) are read as a layer,
     and a second import (tables replaced) is seen by Refresh."""
-    from geoviewer.io.drillholes import drillhole_signature, read_drillholes_access
+    from geoviewer.io.drillholes import drillhole_signature, read_drillholes_sqlite
     from geoviewer.scene.loaders import load_database_drillholes
 
-    ref = read_drillholes_access(accdb)
+    ref = read_drillholes_sqlite(surpac_sqlite)
     target = database.project_target(tmp_path)
     with target.connect() as con:
         con.write_frame("drillhole_collar", ref.collars[["hole_id", "x", "y", "z", "max_depth"]])

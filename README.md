@@ -26,12 +26,15 @@ The stack is Python 3.10, PySide6 (Qt 6), VTK/PyVista and NumPy/pandas. It is pa
   - [Workspaces and refresh](#workspaces-and-refresh)
   - [3D and 2D views](#3d-and-2d-views)
   - [Block models and constraints](#block-models-and-constraints)
+  - [Block Model Manager and grade estimation](#block-model-manager-and-grade-estimation)
   - [Identify and measure](#identify-and-measure)
   - [Cross-sections](#cross-sections)
   - [Drillholes: log window and Drillhole Manager](#drillholes-log-window-and-drillhole-manager)
   - [Underground survey (pits and drives)](#underground-survey-pits-and-drives)
+  - [Importing from Excel](#importing-from-excel)
   - [Pit export: SHP, 3D DTM, PNG](#pit-export-shp-3D-dtm-png)
   - [Reserve and mined shapes](#reserve-and-mined-shapes)
+  - [Decision support (AI, offline)](#decision-support-ai-offline)
   - [Map export](#map-export)
   - [Settings and the project database](#settings-and-the-project-database)
   - [Keyboard shortcuts](#keyboard-shortcuts)
@@ -60,7 +63,7 @@ The toolbar groups, top to bottom:
 2. **Navigation**: rotate, pan, zoom in, zoom out, home.
 3. **Views**: 3D, plan XY, section XZ, section YZ, perspective/orthographic, map grid.
 4. **Tools**: identify, measure, cross-section.
-5. **Data**: Drillhole Manager, Survey, Reserve, mined outline.
+5. **Data**: Drillhole Manager, Block Model Manager, Survey, Reserve, mined outline.
 6. **Window**: full screen, settings, hide toolbar.
 
 ### Supported data
@@ -69,7 +72,7 @@ The toolbar groups, top to bottom:
 |---|---|---|
 | 3D strings | `.str` | Records are `string, Y, X, Z, D1…`. Styles come from the `.ssi` file named in the header. |
 | 3D DTM surfaces and solids | `.dtm` (with its `.str`) | Each trisolation becomes an object. Solids are recognised from their geometry (watertight), not from the `closed` flag. |
-| Block models | `.csv` (3D block export) | Columns X, Y, Z, block sizes and any attributes. Only the **exposed faces** are drawn, never buried or shared faces, so models of 10–40 million blocks stay responsive. Parsed models are cached in `%LOCALAPPDATA%\GeoViewer\cache`. |
+| Block models | `.gvbm` (GeoViewer block model) or `.csv` (block export) | `.gvbm` files are made by the [Block Model Manager](#block-model-manager-and-grade-estimation): compressed and encrypted. CSV: columns X, Y, Z, block sizes and any attributes. Only the **exposed faces** are drawn, never buried or shared faces, so models of 10–40 million blocks stay responsive. Parsed CSV models are cached in `%LOCALAPPDATA%\GeoViewer\cache`, encrypted like `.gvbm` files (never as plain arrays). |
 | Drillholes | project database, 3D `.accdb` / `.mdb` / `.ddb`, or collar + survey + interval CSVs | Desurveyed with the minimum-curvature method. Holes are drawn as tubes (per-layer diameter) coloured by lithology. The `.accdb` is read directly, so no ODBC driver is needed. |
 | DXF | `.dxf` | Includes old R10 files. |
 | Underground survey | project database | Drawn from the survey records (see [Underground survey](#underground-survey-pits-and-drives)). |
@@ -108,6 +111,73 @@ A **workspace** is a folder of data files plus a `geoviewer_workspace.json` file
   Combine the conditions with *all* (and), *any* (or), or a custom expression such as `a and (b or not c)`. The expression is parsed by the app itself, never passed to `eval`. The dialog shows a live count of blocks kept.
 
 ![Constraint dialog: blocks kept inside the ore solid](docs/images/constraint.png)
+
+### Block Model Manager and grade estimation
+
+Block values are sensitive data, so GeoViewer keeps block models in its own **binary file, `.gvbm`**:
+- **Compressed**: often 20× smaller than the CSV.
+- **Encrypted**: AES-256-GCM, with a per-file key derived from a secret built into GeoViewer. Only GeoViewer can read it.
+- **Tamper-proof**: a changed or cut-short file fails to open, so it never shows wrong values.
+
+The block model ASCII export is needed only once, for the import.
+
+**Block Model Manager** (Ctrl+B, in the toolbar's *Data* group) lists the `.gvbm` files of the workspace:
+
+- **New from solid**: blocks inside an ore solid (any closed DTM in the workspace, or *Browse*).
+  - Set the block size (X, Y, Z) and the origin. The automatic origin uses whole blocks below the solid.
+  - Optional **sub-blocking** at the boundary (2, 4 or 8 per axis) follows the solid's shape closely: the blocks' volume is within about 1 % of the solid's.
+  - Add float attributes with their default values (empty = the null value, -99).
+- **Import Surpac ASCII**: a Surpac block model text or CSV export becomes a `.gvbm` file. Comma, tab, semicolon and space separators work, and description lines above the column names are skipped.
+- **Attributes**:
+  - **Add**: name, default value, description.
+  - **Edit**: rename, change the description.
+  - **Remove**.
+  - **Fill** with a value: on all blocks, on blocks without a value, or inside / outside a solid.
+- **History**: every operation (created, imported, estimated, …) is noted in the file.
+- Changes stay in memory until **Save**. The block model layer in the view is then read again.
+
+**Estimate grade** fills an attribute in four steps:
+
+1. **Samples**
+   - From any drillhole layer: assays **composited** to equal lengths down each hole (length-weighted, with a minimum cover for the last piece).
+   - Or from the points of a Surpac **point string file**, with the value in D1, D2, ….
+   - Values below 0 can count as missing (e.g. -1 = not sampled).
+   - Optional **top cut**. *Suggest* proposes the 99th percentile when the highest values stand far above the rest.
+   - Optional **domain** solid: only samples inside it are used.
+   - Statistics: count, mean, CV and percentiles.
+2. **Variogram**
+   - Experimental semi-variograms: omnidirectional (in the ellipsoid's distance), or along the major, semi-major and minor axes. Point size shows the pair count.
+   - The model: a nugget plus one or two structures (spherical, exponential, gaussian), with anisotropy (bearing, plunge, dip, semi/major and minor/major ratios).
+   - **Suggest model (auto fit)**:
+     - picks the lag from the drill spacing;
+     - adds fine lags at the composite length, so the downhole pairs set the nugget;
+     - fits the model by weighted least squares;
+     - finds the direction of longest continuity from directional variograms every 22.5°.
+3. **Estimate**
+   - Methods: **ordinary kriging**, **simple kriging**, **inverse distance** (with a power) or **nearest neighbour**.
+   - Kriging is block kriging with discretisation (default 3 × 3 × 2 points per block).
+   - Search: the variogram's ellipsoid or its own, radius, minimum / maximum samples, **maximum samples per drillhole**, and up to 3 passes that enlarge the ellipsoid.
+   - Blocks: all, or only those inside a solid.
+   - Extra outputs, stored as `<attr>_ns`, `_dist`, `_pass`, `_kv`, `_ke` and `_sor`: number of samples, mean distance, search pass, kriging variance, kriging efficiency, slope of regression.
+   - **Suggest search (cross-validation)** tries several hundred combinations of radius, minimum / maximum samples and samples per hole.
+     - Each sample is estimated without its own drillhole.
+     - The most accurate combination that still estimates nearly every sample wins.
+     - For IDW it also picks the power.
+4. **Validate**: the checks before an estimate is used, shown with traffic lights and plain sentences.
+   - **Cross-validation** (leave one drillhole out): mean error, RMSE, correlation and the **slope of regression**, with a scatter chart of true value against estimate.
+   - **Global bias**: the block mean against a **nearest neighbour** model, which serves as a declustered reference.
+   - **Smoothing**: the spread of the block values against the nearest neighbour model's.
+   - **Swath plots** along X, Y and Z: the slice means of the estimate, the nearest neighbour model and the samples.
+
+   When strong smoothing and a low slope occur together, the page says the grade is erratic at this drill spacing, rather than giving contradicting search advice. **Validate …** in the manager repeats the checks for an attribute later.
+
+The samples, variogram and parameters of each estimate are saved with the block model, so the dialog opens again with the same settings.
+
+The heavy steps run in **worker processes**, one per processor core less one for the window: estimation, the search suggestion, variogram fitting, the inside-a-solid test and validation.
+- A progress bar shows the blocks done and the time left. **Cancel** stops the work and leaves the block model unchanged.
+- The window keeps responding throughout.
+- The workers stop when the Block Model Manager or GeoViewer closes. They also stop by themselves if GeoViewer ends unexpectedly.
+
 
 ### Identify and measure
 
@@ -162,10 +232,47 @@ The section ends are labelled **A** and **A'**, and bends are numbered. The wind
 - Assay fields can be added, renamed or removed.
 - The Rock cell picks from the **Rock colours** list, and those colours are used in the 3D view and in sections.
 - **Export to Excel** writes the collar, geology, survey and assay sheets.
+- **Import from Excel** adds or updates many holes at once (see [Importing from Excel](#importing-from-excel)).
+  - The template has the sheets collar, survey, geology and assay, with this database's own columns, including its assay fields.
+  - A workbook made by **Export to Excel** can be edited and imported again.
+  - An extra assay column, for example `copper`, becomes a new assay field.
+  - A hole already in the database gets the file's collar values. Its survey, geology or assay rows are replaced only in the sheets that have rows for it; its other tables are kept.
+- **Drilling records** of each hole (see [Drilling records](#drilling-records-shared-with-the-drilling-failure-prediction-system)):
+  - the Collar tab's **Drilling records** box: area, rig, planned azimuth / dip / depth, casing and fluids on site, crew, notes;
+  - the geology's formation, weathering, broken zone and bedding angle;
+  - the tabs **Runs** (with **Next run**), **Hole size**, **Bit**, **Occurrences** and **Failure**, with lists for the codes and **Measures …** to pick measures from the library.
+- **Drilling reference** tab: areas (site sheets), formation cards, rig specifications and the measure library, saved table by table.
+- **Import / Export drilling history …**: the drilling records as CSV files, one per table.
+- The hole list can be filtered by drilling area.
 
 | Holes | Rock colours |
 |---|---|
 | ![Drillhole Manager: collar form of a selected hole](docs/images/drillhole_manager.png) | ![Drillhole Manager: rock colours tab](docs/images/drillhole_rock_colours.png) |
+
+### Drilling records (shared with the Drilling Failure Prediction system)
+
+GeoViewer records the drilling history of each hole: how it was drilled, what went wrong and what was done about it. It uses the **same tables** as the Drilling Failure Prediction system (`drill_fail_predict`), so both programs work on one database. GeoViewer only records the history; it has no prediction.
+
+The tables are described once in `geoviewer/io/drilling_schema.py`. The other programs keep an identical copy of that file.
+
+| Table | Content |
+|---|---|
+| `drillhole_collar` | GeoViewer's fields, plus `area_id`, `rig_model`, `plan_azimuth`, `plan_dip`, `planned_depth`, `casing_available`, `fluids_available`, `crew`, `notes` |
+| `drillhole_geology` | `rock`, `note`, plus `formation`, `weathering`, `broken`, `bedding_angle` |
+| `drillhole_run`, `drillhole_hole_size`, `drillhole_bit` | Drilling parameters per core run (RPM, ROP, flow, pump pressure, return, rod drop, WOB, torque, fluid, recovery), hole sizes, bits |
+| `drillhole_occurrence`, `drillhole_failure` | Cavities, fault zones and other problems, with measures and solved Y/N; the failure of a failed hole |
+| `drillhole_area`, `drillhole_formation`, `drillhole_rig`, `drillhole_measure` | Site sheets, formation property cards, rig limits, the measure library (37 predefined measures and 2 example rigs, filled into empty tables) |
+
+Conventions:
+- **Dips** are degrees from straight down everywhere (0 = down), as in `drillhole_survey`. This includes the planned dip.
+- **`max_depth`** is the depth reached. It is 0 for a planned hole; the designed depth is `planned_depth`.
+- **`state`** is the one status of a hole: Planned, In work, Completed with ore hit, Completed without ore hit, Failed. The drilling result (success / failed / in progress / planned) follows from it; a success whose ore hit is not known is stored as Completed without ore hit.
+- **Each program keeps the other's data.** A hole saved in one program keeps the fields that only the other program writes.
+
+Other behaviour:
+- **CSV files** of the drilling history (`collar.csv`, `run.csv`, …) use the exchange format of the prediction system: dips negative downward, `final_depth`, `result`. Import and export convert.
+- **Earlier databases.** A database made by an earlier `drill_fail_predict` (tables `risk_collar`, `risk_run`, …) is moved into these tables when it is opened, once. The old tables are kept as `risk_*_old`.
+- **Drilling area in the 3D view.** The drillhole layer's **Area** setting (Properties) shows one area, all areas, or **Automatic**. Automatic shows the areas with holes in work or planned, so a history from distant areas stays out of the view.
 
 ### Underground survey (pits and drives)
 
@@ -184,6 +291,12 @@ The **Survey** window (Ctrl+U) is for traversing underground workings where GPS 
 - **Closure**: closing a traverse on a known station or back on the entrance reports its closure. A passing closure can be spread with the **Bowditch** method.
 - **Profile**: each pit has a rectangular profile (width × height). You choose whether its stations are in the backs (roof), the floor or the middle.
 - **Live plan map**: wheel to zoom, drag to pan, double-click to fit. It shows stations, legs and survey direction, and highlights the selected pit.
+- **Import from Excel** adds or updates pits and their setups at once (see [Importing from Excel](#importing-from-excel)).
+  - The template has two sheets. **pits** has one row per pit: name, code, parent (empty for a main pit), start station, the entrance's X, Y, Z, profile, station level and Bowditch.
+  - **setups** has one row per setup, in order, naming its pit. Its `method` column is `angles`, `bearing` or `coords`, the same three methods as in the window.
+  - A branch can name its parent by name or by code, including a code the import gives it, such as P1.
+  - The traverse is computed during the check, so a setup that cannot be computed or a failed closure shows before anything is written.
+  - A pit already in the database is found by its name. Empty cells in its row keep what is stored; its setups are replaced only when the setups sheet has rows for it.
 
 ![Survey window: pit tree, traverse setups, setup form, live plan map and station coordinates](docs/images/survey_manager.png)
 
@@ -196,6 +309,25 @@ The **Survey** window (Ctrl+U) is for traversing underground workings where GPS 
 Where a branch meets its parent, the branch starts at the parent's wall and does not overlap inside the parent drive. Inclined drives keep their roof and floor wedges, so the walls meet without gaps.
 
 ![Surveyed drives in 3D: main decline, levels and crosscuts](docs/images/survey_3d.png)
+
+### Importing from Excel
+
+The Drillhole Manager and the Survey window each have an **Import from Excel …** button. Both work the same way:
+
+1. **Save template …** writes an empty workbook:
+   - an **Instructions** sheet, in the current language, that explains every column with an example;
+   - one sheet per table, with the column names in the first row. Required columns are orange, and each header has a note.
+   - Lists to pick from (hole state, method, bearing kind, station level), number checks and text-formatted ID and angle columns help while typing. Angles typed as `120:30:00` stay text instead of becoming a time.
+2. Fill it in with Excel and save it.
+3. Choose the file. It is **checked before anything is written**:
+   - **errors** name the sheet and the row, for example *Hole WD4: Geology row 3: From must be 0 or more and less than To*. Import stays disabled until they are corrected; **Check again** reads the file again after it is fixed in Excel.
+   - **warnings**, for example an interval past the end of the hole, are shown but do not stop the import.
+4. Choose what happens to holes or pits **already in the database**: replace them with the file's data, or leave them as they are.
+5. **Import** writes everything in one transaction.
+
+The column names stay in English in every language, because the import finds the columns by these names. Values from a list may be typed in any language the app has; for example, a hole state written in Chinese is read correctly while the app runs in English.
+
+![Import from Excel: the check lists an error and a warning by sheet and row before anything is imported](docs/images/excel_import.png)
 
 ### Pit export: SHP, 3D DTM, PNG
 
@@ -237,6 +369,63 @@ The **Reserve** window (Ctrl+E) tracks production against the block model reserv
 Records are kept in the project database. The block model file is never changed.
 
 ![Reserve window: total, produced and remaining cards and the mined shapes table](docs/images/reserve.png)
+
+### Decision support (AI, offline)
+
+Four assistants help with everyday decisions. They run entirely on this computer, with no internet connection and no online model: they are local statistics, search and optimisation on the project's own data. They only **suggest**: every result is explained in plain words, and nothing in the database or the files changes until you accept it.
+
+**Reserve advisor**: the **Advisor** button in the Reserve window.
+
+- **Life of the reserve**: the typical monthly production (the median of the recent full months), how long the remaining ore lasts at that rate with a slow / fast range, and the month it runs out. It also warns when production falls or rises sharply, and when recent cuts are much richer than the ore left (high-grading) or much poorer (dilution).
+- **Check of the cuts**: every recorded cut gets a traffic light (OK / Check / Problem) and a reason. For example: mostly outside the reserve, no new ore, mostly mined by earlier cuts (drawn twice?), unusual thickness, low or high grade against the reserve average. Double-click a cut to open it.
+
+![Reserve advisor: typical month, ore left, how long it lasts, the forecast chart and the findings](docs/images/ai_reserve_advisor.png)
+
+**Suggest best levels**: in the mined-cut dialog.
+
+- Finds the From / To of the chosen thickness under the outline that gives the **most metal**, the **highest grade** or the **most ore**, counting only ore not mined yet.
+- It shows how much more metal that is than your levels, and the next best windows.
+
+![Suggest best levels in the mined-cut dialog](docs/images/ai_suggest_levels.png)
+
+**Closure check**: the **Closure check** button in the Survey window.
+
+- When a traverse does not close, it tries every usual single field-book mistake on every setup and recomputes the traverse for each:
+  - a reading 180° off (face right taken as face left);
+  - backsight and foresight HA swapped;
+  - a zenith angle written as a vertical angle;
+  - HI and HT swapped;
+  - two figures swapped in a distance, angle or bearing;
+  - a compass bearing reversed or of the wrong kind;
+  - the wrong backsight station;
+  - the sign of the declination or convergence.
+- It ranks the corrections by the misclosure left and says how likely each is. A bar chart and a plan show the traverse as surveyed and as corrected.
+- **Use this correction** puts the value into the setup; you check it and save.
+
+![Closure check: the misclosure, the most likely cause, the bar chart and the plan](docs/images/ai_closure_check.png)
+
+**Route designer**: the **Design a route ...** button in the Survey window.
+
+- **The map from the start:** it shows every pit with its stations. The start (A) and the target (B) appear at once and follow the inputs as you type.
+  - A dashed straight line joins them, and a sentence says whether a straight drive is within the gradient limit or how long the drive must be at least.
+  - Click the map to put the target there.
+  - Wheel zooms, drag pans, double-click (or the button) shows everything, and **+ / −** zoom.
+  - **Export map PNG ...** saves the view as a 300 dpi PNG on white.
+- **The design:** it reaches the target station or point as **short as possible**, never steeper than the gradient limit (e.g. 1 in 7). It keeps a clearance from old workings (the mined shapes), from the other drives and, if you ask, from the ore body.
+  - When the target is too high or too low for a straight drive, the route must be longer than the straight line. It then makes one loop with gradual bends, and the window says by how much it is longer than the minimum.
+  - Bends keep the **smallest bend radius** (default 15 m, for trucks), and the legs of a loop keep the clearance from each other.
+  - When the start is boxed in by other drives, tighter bends are used and the window says so.
+- **The result:**
+  - length, height change, steepest part, closest approach to old workings and an estimated cost (or the waste rock);
+  - plain-language findings;
+  - a long section coloured by gradient, and the station list.
+- **Output:** **Show in the 3D view** draws the drive see-through. **Export Surpac string ...** and **Export stations (CSV) ...** save the design. The survey records are not changed.
+- **Method:** a gradient-limited 3D grid search (A*).
+  - The grid is sized so that the start and the target are exactly grid points.
+  - Each search state remembers its heading and how far it has gone straight. A turn of 45° is allowed only after enough straight run for the bend radius, and each turn costs a little, so among routes of the same length the smoothest wins.
+  - The path is then straightened into a few legs (bends stay gradual) and measured exactly.
+
+![Route designer: settings, results, findings and the plan of the new drive](docs/images/ai_route_designer.png)
 
 ### Map export
 
@@ -299,6 +488,7 @@ The new file is found automatically and listed in Settings, and the release buil
 | F5 | Refresh | Ctrl+L | Mined outline (2D) |
 | Ctrl+1 … Ctrl+4 | 3D / XY / XZ / YZ | Ctrl+E | Reserve |
 | Ctrl+5 | Perspective / orthographic | Ctrl+D | Drillhole Manager |
+| Ctrl+B | Block Model Manager | | |
 | Ctrl+G | Map grid | Ctrl+U | Survey |
 | Ctrl+R / Ctrl+P | Rotate / pan mode | Ctrl+Shift+P | Export map |
 | Ctrl+= / Ctrl+- | Zoom in / out | Ctrl+, | Settings |
@@ -372,7 +562,7 @@ Use `PySide6_Essentials` only. The full `PySide6` meta-package pulls in WebEngin
 
 ## How to Test
 
-The tests use **pytest** and live in `tests\`. There are 286 tests.
+The tests use **pytest** and live in `tests\`. There are 314 tests.
 
 ```bat
 :: everything (what install_env.bat runs)
@@ -393,12 +583,16 @@ install_env.bat /test
 |---|---|
 | 3D readers (STR, DTM, SSI), DXF | `test_3D_str_dtm.py`, `test_ssi.py`, `test_scene_utils.py` |
 | Block models, exposed faces, constraints | `test_block_model.py`, `test_block_faces.py` |
+| Block Model Manager (`.gvbm` file, model inside a solid, Surpac import, attributes, samples, search, variogram, kriging / IDW, validation, the manager window) | `test_block_manager.py` |
 | Drillholes (desurvey, log window, database, manager) | `test_drillholes.py`, `test_drillhole_store.py` |
+| Drilling records (shared tables, conventions, earlier risk_ databases, checks, CSV history, layer area, manager tabs) | `test_drilling_records.py` |
 | Views, navigation, grid, identify, measure | `test_navigation.py`, `test_map_grid.py`, `test_identify.py`, `test_measure.py` |
 | Cross-sections and map export | `test_section.py`, `test_map_export.py` |
 | Underground survey and pit export | `test_survey.py`, `test_survey_display.py`, `test_survey_manager.py`, `test_pit_export.py` |
 | Reserve and production | `test_production.py` |
 | Workspaces | `test_workspace.py` |
+| Import from Excel (templates, checks, replace or skip, the import window) | `test_excel_import.py` |
+| Decision support (forecast, cut check, best levels, closure check, route designer, their windows) | `test_ai.py` |
 | Languages (catalog complete, placeholders, Qt translation, VTK font, windows in Chinese) | `test_i18n.py` |
 | MySQL backend | `test_mysql.py` (see below) |
 
@@ -471,14 +665,23 @@ geoviewer/
   workspace.py        workspace JSON (layers, view, per-pit styles)
   i18n/               translations: tr() / trn() / trc(), locales/<code>.json (zh_CN.json)
   project_db.py       project database initialisation (add-only)
+  ai/                 decision support (offline): reserve_advisor, closure_doctor, route_planner
+  blockmodel/         block model management (no Qt): store (.gvbm encrypted file), build (inside a
+                      solid, Surpac ASCII import), attributes, samples (composites, point strings),
+                      search (anisotropy, neighbours), variogram, estimate (OK/SK/IDW/NN,
+                      cross-validation), validate (bias, smoothing, swaths)
   io/                 readers and stores: 3D STR/DTM/SSI, block model CSV + cache, DXF,
-                      drillholes (.accdb/CSV/database), survey_store, pit_export (SHP/DTM),
-                      database (SQLite/MySQL)
+                      drillholes (.accdb/CSV/database), drilling_schema (drilling records shared with
+                      drill_fail_predict), survey_store, pit_export (SHP/DTM),
+                      excel_template + drillhole_import + survey_import (Excel templates
+                      and import), database (SQLite/MySQL)
   scene/              VTK scene and layers: block faces, constraints, sections, survey drives,
                       production/depletion, reserve, map grid, picking
   ui/                 Qt windows: main window, floating toolbar, layer tree, properties,
                       section tool/view/print, drillhole log/manager, survey manager,
-                      reserve, map export, settings
+                      excel_import (the import window), reserve, map export, settings,
+                      ai_widgets + reserve_advisor_dialog + closure_dialog + route_dialog,
+                      block_manager + estimation_dialog (block models, grade estimation)
 packaging/            PyInstaller spec, entry script, icon, build_release.py
 tools/                pip_check.py, smoke_test.py, i18n_extract.py (language files)
 tests/                pytest suite (+ tests/data)

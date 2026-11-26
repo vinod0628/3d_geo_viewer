@@ -487,18 +487,23 @@ def build_section(scene, line: SectionLine, half_width: float) -> SectionResult:
                 continue
             # Later actors of a layer draw over earlier ones (drillhole intervals over the trace).
             dz = 0.05 * k
-            data = actor.GetMapper().GetInput() if actor.GetMapper() is not None else None
+            # drillholes drawn as cylinders keep their path: the section shows the hole as a thick line
+            # along it, projected from the whole corridor (not the outline where the plane cuts the cylinder)
+            path = getattr(actor, "_gv_lines", None)
+            data = path if path is not None else (actor.GetMapper().GetInput() if actor.GetMapper() is not None
+                                                  else None)
             if not isinstance(data, vtk.vtkPolyData):
                 continue
             mesh = pv.wrap(data)
+            width = getattr(actor, "_gv_section_width", None)
             for panel in line.panels:
-                outs = [cut_polygons(mesh, panel, ax, DEPTH_SURFACE + dz),
+                outs = [None if path is not None else cut_polygons(mesh, panel, ax, DEPTH_SURFACE + dz),
                         cut_lines(mesh, panel, ax, half_width, DEPTH_LINES + dz),
                         cut_points(mesh, panel, ax, half_width, DEPTH_POINTS + dz)]
                 for kind, out in zip(("poly", "line", "point"), outs):
                     if out is None or out.n_points == 0:
                         continue
-                    res.actors.append(clone_actor(actor, out, 2.0 if kind == "poly" else None))
+                    res.actors.append(clone_actor(actor, out, 2.0 if kind == "poly" else width))
                     res.bounds = _merge_bounds(res.bounds, out)
                     pieces += 1
                     if kind == "line" and "gv_hole" in out.cell_data:

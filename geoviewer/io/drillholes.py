@@ -271,6 +271,49 @@ class DrillholeDB:
     def hole_ids(self) -> list[str]:
         return self.collars["hole_id"].tolist()
 
+    # --- drilling areas (drillhole_collar.area_id, see drilling_schema.py) ------------------
+    def _area_column(self) -> str | None:
+        return next((c for c in self.collars.columns if str(c).lower() == "area_id"), None)
+
+    def area_counts(self) -> dict[str, int]:
+        """Area -> number of holes ({} when the collars have no areas)."""
+        col = self._area_column()
+        if col is None:
+            return {}
+        s = self.collars[col].dropna().astype(str).str.strip()
+        return {str(k): int(v) for k, v in s[s != ""].value_counts().sort_index().items()}
+
+    def live_areas(self) -> list[str]:
+        """The areas of the holes being drilled or planned (state In work / Planned)."""
+        col = self._area_column()
+        st = next((c for c in self.collars.columns if str(c).lower() == "state"), None)
+        if col is None or st is None:
+            return []
+        from .drilling_schema import IN_WORK, PLANNED, _state_number
+
+        live = [_state_number(v) in (IN_WORK, PLANNED) or str(v).strip().lower() in ("in work", "planned")
+                for v in self.collars[st]]
+        return sorted({str(a) for a, m in zip(self.collars[col], live) if m and pd.notna(a) and str(a).strip()})
+
+    def only_areas(self, areas) -> "DrillholeDB":
+        """The holes of these areas (a new DrillholeDB; surveys and intervals follow)."""
+        col = self._area_column()
+        if col is None:
+            return self
+        keep = set(self.collars.loc[self.collars[col].astype(str).isin({str(a) for a in areas}), "hole_id"])
+        return self.subset(keep)
+
+    def subset(self, hole_ids) -> "DrillholeDB":
+        """Only these holes (a new DrillholeDB; the same translations, colours and settings)."""
+        import dataclasses
+
+        keep = {str(h) for h in hole_ids}
+        return dataclasses.replace(
+            self, collars=self.collars[self.collars["hole_id"].isin(keep)].reset_index(drop=True),
+            surveys=self.surveys[self.surveys["hole_id"].isin(keep)].reset_index(drop=True),
+            intervals={k: v[v["hole_id"].isin(keep)].reset_index(drop=True) for k, v in self.intervals.items()},
+            warnings=list(self.warnings), _traces={})
+
     def code_descriptions(self, table: str, field_name: str) -> dict[str, str]:
         """Code -> description from a Surpac translation table, if present."""
         tr = self.translations

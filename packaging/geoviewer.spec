@@ -40,7 +40,7 @@ EXCLUDES = [
     "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets", "PySide6.QtQuick3D",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
     "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets", "PySide6.Qt3DCore", "PySide6.QtCharts",
-    "PySide6.QtDesigner", "PySide6.QtHelp", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtNetwork",
+    "PySide6.QtDesigner", "PySide6.QtHelp", "PySide6.QtSql", "PySide6.QtTest",
     "PySide6.QtBluetooth", "PySide6.QtPositioning", "PySide6.QtSerialPort", "PySide6.QtWebSockets",
 ]
 
@@ -64,6 +64,9 @@ a = Analysis(
         "vtkmodules.vtkRenderingFreeType",
         "vtkmodules.vtkRenderingAnnotation",
         "pyarrow.vendored.version",
+        # run in the estimation worker processes (imported there by name)
+        "geoviewer.blockmodel.parallel", "geoviewer.blockmodel.estimate", "geoviewer.blockmodel.variogram",
+        "geoviewer.blockmodel.samples", "geoviewer.blockmodel.search", "geoviewer.blockmodel.validate",
     ],
     hookspath=[],
     runtime_hooks=[],

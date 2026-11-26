@@ -19,6 +19,12 @@ Tables (made by the database set-up when missing):
                      elsewhere - they are used as they are, like a known station), note
     survey_shots     id, setup_id, role ("BS" / "FS"), face ("L" / "R"), target, ha, za, sd, ht
     survey_settings  setting, value (closure tolerance, grid convergence, magnetic declination)
+    survey_designs   id, name, start_pit_id (the pit the design starts on, if any), start_name,
+                     target_name, profile_width, profile_height, station_level, gradient (the
+                     steepest slope allowed, rise / run), steepest, length, climb (m), params (the
+                     other settings of the design, JSON), note, created_at - a designed pit (a
+                     drive designed with the route designer, not surveyed)
+    survey_design_points  id, design_id, seq, x, y, z - its centre line, in order
 
 Angles are stored in decimal degrees; bearings clockwise from grid north. The engineer edits
 one row per setup (``SetupRow``, like a field book line); it is stored as shots. After every
@@ -36,6 +42,8 @@ from ..i18n import N_, tr
 
 PITS, STATIONS, SETUPS, SHOTS, SETTINGS = ("survey_pits", "survey_stations", "survey_setups", "survey_shots",
                                            "survey_settings")
+DESIGNS, DESIGN_POINTS = "survey_designs", "survey_design_points"
+TABLES = (PITS, STATIONS, SETUPS, SHOTS, SETTINGS, DESIGNS, DESIGN_POINTS)
 BEARING_TYPES = ("grid", "true", "magnetic")
 DEFAULT_SETTINGS = {"closure_ratio": 10000.0, "convergence": 0.0, "declination": 0.0}
 FACE_TOLERANCE = 30.0 / 3600.0          # degrees: face left / right readings further apart are flagged
@@ -61,6 +69,12 @@ def _ddl(mysql: bool) -> dict[str, str]:
                f"role VARCHAR(2) NOT NULL, face CHAR(1) NOT NULL, target VARCHAR(64), ha DOUBLE, za DOUBLE, "
                f"sd DOUBLE, ht DOUBLE){opts}",
         SETTINGS: f"CREATE TABLE {SETTINGS} (setting VARCHAR(100) NOT NULL PRIMARY KEY, value TEXT){opts}",
+        DESIGNS: f"CREATE TABLE {DESIGNS} (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(100) NOT NULL, "
+                 f"start_pit_id INTEGER, start_name VARCHAR(100), target_name VARCHAR(100), profile_width DOUBLE, "
+                 f"profile_height DOUBLE, station_level VARCHAR(10), gradient DOUBLE, steepest DOUBLE, "
+                 f"length DOUBLE, climb DOUBLE, params TEXT, note TEXT, created_at VARCHAR(19)){opts}",
+        DESIGN_POINTS: f"CREATE TABLE {DESIGN_POINTS} (id INTEGER NOT NULL PRIMARY KEY, design_id INTEGER NOT NULL, "
+                       f"seq INTEGER NOT NULL, x DOUBLE, y DOUBLE, z DOUBLE){opts}",
     }
 
 
@@ -79,9 +93,15 @@ _FIELDS = {
     SHOTS: [("setup_id", "INTEGER"), ("role", "VARCHAR(2)"), ("face", "CHAR(1)"), ("target", "VARCHAR(64)"),
             ("ha", "DOUBLE"), ("za", "DOUBLE"), ("sd", "DOUBLE"), ("ht", "DOUBLE")],
     SETTINGS: [("setting", "VARCHAR(100)"), ("value", "TEXT")],
+    DESIGNS: [("name", "VARCHAR(100)"), ("start_pit_id", "INTEGER"), ("start_name", "VARCHAR(100)"),
+              ("target_name", "VARCHAR(100)"), ("profile_width", "DOUBLE"), ("profile_height", "DOUBLE"),
+              ("station_level", "VARCHAR(10)"), ("gradient", "DOUBLE"), ("steepest", "DOUBLE"), ("length", "DOUBLE"),
+              ("climb", "DOUBLE"), ("params", "TEXT"), ("note", "TEXT"), ("created_at", "VARCHAR(19)")],
+    DESIGN_POINTS: [("design_id", "INTEGER"), ("seq", "INTEGER"), ("x", "DOUBLE"), ("y", "DOUBLE"), ("z", "DOUBLE")],
 }
 _INDEXES = ((STATIONS, "idx_survey_stations_pit", ["pit_id"]), (SETUPS, "idx_survey_setups_pit", ["pit_id", "seq"]),
-            (SHOTS, "idx_survey_shots_setup", ["setup_id"]))
+            (SHOTS, "idx_survey_shots_setup", ["setup_id"]),
+            (DESIGN_POINTS, "idx_survey_design_points", ["design_id", "seq"]))
 
 
 # --- angles ---------------------------------------------------------------------------------------
@@ -187,6 +207,42 @@ class Pit:
 
 
 STATION_LEVELS = {"back": N_("Backs (roof)"), "floor": N_("Floor"), "middle": N_("Middle")}  # tr() where shown
+
+
+@dataclass
+class DesignPit:
+    """A designed pit: a drive designed with the route designer (its centre line and profile), kept
+    apart from the surveyed pits - nothing is surveyed or computed from it."""
+    id: int
+    name: str
+    points: list                        # [(x, y, z)] centre line, in order
+    profile_width: float = 5.0
+    profile_height: float = 5.0
+    station_level: str = "middle"       # where the points are in the profile (as Pit.station_level)
+    start_pit_id: int | None = None     # the surveyed pit it starts on (None: not known)
+    start_name: str = ""
+    target_name: str = ""
+    gradient: float | None = None       # the steepest slope allowed (rise / run)
+    steepest: float | None = None       # the steepest leg designed
+    length: float = 0.0                 # m, along the drive
+    climb: float = 0.0                  # m, end minus start
+    params: dict = field(default_factory=dict)
+    note: str = ""
+    created_at: str = ""
+
+
+def design_measures(points) -> tuple:
+    """(length along the drive, end minus start height, steepest leg as rise / run) of a centre line
+    [(x, y, z)] - as the route designer measures a design."""
+    length, steepest = 0.0, 0.0
+    for a, b in zip(points[:-1], points[1:]):
+        dx, dy, dz = (float(b[k]) - float(a[k]) for k in range(3))
+        plan = math.hypot(dx, dy)
+        length += math.sqrt(plan * plan + dz * dz)
+        if plan > 1e-9:
+            steepest = max(steepest, abs(dz) / plan)
+    climb = float(points[-1][2]) - float(points[0][2]) if len(points) >= 2 else 0.0
+    return length, climb, steepest
 
 
 def next_code(pits: list, parent_id: int | None) -> str:
@@ -519,7 +575,7 @@ class SurveyStore:
                 return self.prepare(con)
         notes = []
         ddl = _ddl(db.is_mysql)
-        for name in (PITS, STATIONS, SETUPS, SHOTS, SETTINGS):
+        for name in TABLES:
             stored = db.table_name(name)
             if stored is None:
                 db.execute(ddl[name])
@@ -615,8 +671,10 @@ class SurveyStore:
                 db.execute(f"UPDATE {PITS} SET note = ? WHERE id = ?", (_txt(note), pid))
 
     def delete_pit(self, pid: int) -> list[int]:
-        """Delete a pit, its branches (all levels), their setups, shots and computed stations.
-        Returns the ids deleted."""
+        """Delete a pit, its branches (all levels), their setups, shots, computed stations and
+        mapped geology. Returns the ids deleted."""
+        from .pit_geology_store import PitGeologyStore
+
         pits = self.pits()
         ids, todo = [], [pid]
         while todo:
@@ -631,6 +689,7 @@ class SurveyStore:
                 db.execute(f"DELETE FROM {SETUPS} WHERE pit_id = ?", (p,))
                 db.execute(f"DELETE FROM {STATIONS} WHERE pit_id = ?", (p,))
                 db.execute(f"DELETE FROM {PITS} WHERE id = ?", (p,))
+            PitGeologyStore.delete_pits(db, ids)
         return ids
 
     # --- stations -------------------------------------------------------------------------
@@ -698,46 +757,163 @@ class SurveyStore:
         """Replace a pit's setups (and their shots) with ``rows``, in this order; new foresight
         stations are added to the pit. Then the whole network is computed and stored."""
         with self.target.connect() as db, db.transaction():
-            old = [r[0] for r in db.query(f"SELECT id FROM {SETUPS} WHERE pit_id = ?", (pit_id,))]
-            for s in old:
-                db.execute(f"DELETE FROM {SHOTS} WHERE setup_id = ?", (s,))
-            db.execute(f"DELETE FROM {SETUPS} WHERE pit_id = ?", (pit_id,))
-            sid = int(db.scalar(f"SELECT MAX(id) FROM {SETUPS}", default=0) or 0)
-            shot_id = int(db.scalar(f"SELECT MAX(id) FROM {SHOTS}", default=0) or 0)
-            known = {r[0] for r in db.query(f"SELECT name FROM {STATIONS}")}
-            shots = []
-            for seq, r in enumerate(rows, start=1):
-                sid += 1
-                coords_mode = r.method == "coords"
-                bearing_mode = coords_mode or r.fs_bearing is not None      # no backsight
-                db.execute(f"INSERT INTO {SETUPS} (id, pit_id, seq, survey_date, surveyor, instrument, at_station, hi, "
-                           "bs_station, bs_bearing, bs_bearing_type, note, fs_bearing, fs_bearing_type, fs_x, fs_y, "
-                           "fs_z) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           (sid, pit_id, seq, _txt(r.date), _txt(r.surveyor), _txt(r.instrument), _txt(r.at),
-                            _num(r.hi), None if bearing_mode else _txt(r.bs_station),
-                            None if bearing_mode else _num(r.bs_bearing), r.bs_bearing_type or "grid", _txt(r.note),
-                            None if coords_mode else _num(r.fs_bearing), r.fs_bearing_type or "magnetic",
-                            *((_num(r.fs_x), _num(r.fs_y), _num(r.fs_z)) if coords_mode else (None, None, None))))
-                if not coords_mode and any(v is not None for v in (r.bs_ha, r.bs_za, r.bs_sd)):
-                    shot_id += 1
-                    shots.append((shot_id, sid, "BS", "L", _txt(r.bs_station), r.bs_ha, r.bs_za, r.bs_sd, r.bs_ht))
-                if not coords_mode and (r.bs_ha_r is not None or r.bs_za_r is not None):
-                    shot_id += 1
-                    shots.append((shot_id, sid, "BS", "R", _txt(r.bs_station), r.bs_ha_r, r.bs_za_r, None, None))
-                if r.fs:
-                    shot_id += 1
-                    readings = (None,) * 4 if coords_mode else (r.fs_ha, r.fs_za, r.fs_sd, r.fs_ht)
-                    shots.append((shot_id, sid, "FS", "L", _txt(r.fs), *readings))   # coords: the name only
-                    if not coords_mode and (r.fs_ha_r is not None or r.fs_za_r is not None):
-                        shot_id += 1
-                        shots.append((shot_id, sid, "FS", "R", _txt(r.fs), r.fs_ha_r, r.fs_za_r, None, None))
-                    if _txt(r.fs) not in known:
-                        db.execute(f"INSERT INTO {STATIONS} (name, pit_id, kind, status, active) "
-                                   "VALUES (?, ?, 'station', 'open', 1)", (_txt(r.fs), pit_id))
-                        known.add(_txt(r.fs))
-            db.executemany(f"INSERT INTO {SHOTS} (id, setup_id, role, face, target, ha, za, sd, ht) "
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", shots)
+            self._write_setups(db, pit_id, rows)
         self.recompute()
+
+    @staticmethod
+    def _write_setups(db, pit_id: int, rows: list[SetupRow]) -> None:
+        """``save_setups`` inside the caller's transaction (no computing)."""
+        old = [r[0] for r in db.query(f"SELECT id FROM {SETUPS} WHERE pit_id = ?", (pit_id,))]
+        for s in old:
+            db.execute(f"DELETE FROM {SHOTS} WHERE setup_id = ?", (s,))
+        db.execute(f"DELETE FROM {SETUPS} WHERE pit_id = ?", (pit_id,))
+        sid = int(db.scalar(f"SELECT MAX(id) FROM {SETUPS}", default=0) or 0)
+        shot_id = int(db.scalar(f"SELECT MAX(id) FROM {SHOTS}", default=0) or 0)
+        known = {r[0] for r in db.query(f"SELECT name FROM {STATIONS}")}
+        shots = []
+        for seq, r in enumerate(rows, start=1):
+            sid += 1
+            coords_mode = r.method == "coords"
+            bearing_mode = coords_mode or r.fs_bearing is not None      # no backsight
+            db.execute(f"INSERT INTO {SETUPS} (id, pit_id, seq, survey_date, surveyor, instrument, at_station, hi, "
+                       "bs_station, bs_bearing, bs_bearing_type, note, fs_bearing, fs_bearing_type, fs_x, fs_y, "
+                       "fs_z) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (sid, pit_id, seq, _txt(r.date), _txt(r.surveyor), _txt(r.instrument), _txt(r.at),
+                        _num(r.hi), None if bearing_mode else _txt(r.bs_station),
+                        None if bearing_mode else _num(r.bs_bearing), r.bs_bearing_type or "grid", _txt(r.note),
+                        None if coords_mode else _num(r.fs_bearing), r.fs_bearing_type or "magnetic",
+                        *((_num(r.fs_x), _num(r.fs_y), _num(r.fs_z)) if coords_mode else (None, None, None))))
+            if not coords_mode and any(v is not None for v in (r.bs_ha, r.bs_za, r.bs_sd)):
+                shot_id += 1
+                shots.append((shot_id, sid, "BS", "L", _txt(r.bs_station), r.bs_ha, r.bs_za, r.bs_sd, r.bs_ht))
+            if not coords_mode and (r.bs_ha_r is not None or r.bs_za_r is not None):
+                shot_id += 1
+                shots.append((shot_id, sid, "BS", "R", _txt(r.bs_station), r.bs_ha_r, r.bs_za_r, None, None))
+            if r.fs:
+                shot_id += 1
+                readings = (None,) * 4 if coords_mode else (r.fs_ha, r.fs_za, r.fs_sd, r.fs_ht)
+                shots.append((shot_id, sid, "FS", "L", _txt(r.fs), *readings))   # coords: the name only
+                if not coords_mode and (r.fs_ha_r is not None or r.fs_za_r is not None):
+                    shot_id += 1
+                    shots.append((shot_id, sid, "FS", "R", _txt(r.fs), r.fs_ha_r, r.fs_za_r, None, None))
+                if _txt(r.fs) not in known:
+                    db.execute(f"INSERT INTO {STATIONS} (name, pit_id, kind, status, active) "
+                               "VALUES (?, ?, 'station', 'open', 1)", (_txt(r.fs), pit_id))
+                    known.add(_txt(r.fs))
+        db.executemany(f"INSERT INTO {SHOTS} (id, setup_id, role, face, target, ha, za, sd, ht) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", shots)
+
+    # --- designed pits -------------------------------------------------------------------------
+    def designs(self) -> list[DesignPit]:
+        """The designed pits (none when the tables are not there yet)."""
+        import json
+
+        with self.target.connect(create=False) as db:
+            if db.table_name(DESIGNS) is None or db.table_name(DESIGN_POINTS) is None:
+                return []
+            rows = db.query(f"SELECT id, name, start_pit_id, start_name, target_name, profile_width, profile_height, "
+                            f"station_level, gradient, steepest, length, climb, params, note, created_at FROM {DESIGNS} "
+                            f"ORDER BY id")
+            pts: dict = {}
+            for did, x, y, z in db.query(f"SELECT design_id, x, y, z FROM {DESIGN_POINTS} ORDER BY design_id, seq"):
+                xyz = (_num(x), _num(y), _num(z))
+                if None not in xyz:
+                    pts.setdefault(int(did), []).append(xyz)
+        out = []
+        for i, n, sp, sn, tn, w, h, lv, g, st, ln, cl, prm, nt, at in rows:
+            try:
+                params = json.loads(prm) if prm else {}
+            except (TypeError, ValueError):
+                params = {}
+            out.append(DesignPit(int(i), str(n or ""), pts.get(int(i), []), _num(w) or 5.0, _num(h) or 5.0,
+                                 lv if lv in STATION_LEVELS else "middle", int(sp) if sp is not None else None,
+                                 str(sn or ""), str(tn or ""), _num(g), _num(st), _num(ln) or 0.0, _num(cl) or 0.0,
+                                 params if isinstance(params, dict) else {}, str(nt or ""), str(at or "")))
+        return out
+
+    def add_design(self, d: DesignPit) -> int:
+        """Store a designed pit (its id is given here). Returns the id."""
+        import datetime as _dt
+        import json
+
+        name = _txt(d.name)
+        if not name:
+            raise ValueError(tr("Type a name for the designed pit"))
+        if len(d.points) < 2:
+            raise ValueError(tr("A designed pit needs at least 2 points"))
+        with self.target.connect() as db:
+            if db.table_name(DESIGNS) is None or db.table_name(DESIGN_POINTS) is None:
+                self.prepare(db)
+            if db.scalar(f"SELECT COUNT(*) FROM {DESIGNS} WHERE name = ?", (name,)):
+                raise ValueError(tr("There is already a designed pit named {name}", name=name))
+            did = int(db.scalar(f"SELECT MAX(id) FROM {DESIGNS}", default=0) or 0) + 1
+            pid = int(db.scalar(f"SELECT MAX(id) FROM {DESIGN_POINTS}", default=0) or 0)
+            with db.transaction():
+                db.execute(f"INSERT INTO {DESIGNS} (id, name, start_pit_id, start_name, target_name, profile_width, "
+                           "profile_height, station_level, gradient, steepest, length, climb, params, note, created_at) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (did, name, d.start_pit_id, _txt(d.start_name), _txt(d.target_name), float(d.profile_width),
+                            float(d.profile_height), d.station_level if d.station_level in STATION_LEVELS else "middle",
+                            _num(d.gradient), _num(d.steepest), float(d.length), float(d.climb),
+                            json.dumps(d.params or {}), _txt(d.note),
+                            d.created_at or _dt.datetime.now().isoformat(timespec="seconds")))
+                db.executemany(f"INSERT INTO {DESIGN_POINTS} (id, design_id, seq, x, y, z) VALUES (?, ?, ?, ?, ?, ?)",
+                               [(pid + k, did, k, float(p[0]), float(p[1]), float(p[2]))
+                                for k, p in enumerate(d.points, start=1)])
+        d.id = did
+        return did
+
+    def update_design(self, did: int, name: str, note: str = "", profile: tuple | None = None,
+                      points: list | None = None) -> None:
+        """Change a designed pit: name, note, ``profile`` = (width, height, station level) and its centre line
+        ``points`` [(x, y, z)] (length, height change and steepest leg follow)."""
+        name = _txt(name)
+        if not name:
+            raise ValueError(tr("Type a name for the designed pit"))
+        if points is not None:
+            points = [tuple(float(v) for v in p) for p in points]
+            if len(points) < 2:
+                raise ValueError(tr("A designed pit needs at least 2 points"))
+        with self.target.connect() as db, db.transaction():
+            if db.scalar(f"SELECT COUNT(*) FROM {DESIGNS} WHERE name = ? AND id <> ?", (name, did)):
+                raise ValueError(tr("There is already a designed pit named {name}", name=name))
+            db.execute(f"UPDATE {DESIGNS} SET name = ?, note = ? WHERE id = ?", (name, _txt(note), did))
+            if profile is not None:
+                w, h, level = profile
+                if not (_num(w) and _num(h)) or float(w) <= 0 or float(h) <= 0:
+                    raise ValueError(tr("The profile width and height must be more than 0"))
+                db.execute(f"UPDATE {DESIGNS} SET profile_width = ?, profile_height = ?, station_level = ? WHERE id = ?",
+                           (float(w), float(h), level if level in STATION_LEVELS else "middle", did))
+            if points is not None:
+                length, climb, steepest = design_measures(points)
+                db.execute(f"UPDATE {DESIGNS} SET length = ?, climb = ?, steepest = ? WHERE id = ?",
+                           (length, climb, steepest, did))
+                db.execute(f"DELETE FROM {DESIGN_POINTS} WHERE design_id = ?", (did,))
+                pid = int(db.scalar(f"SELECT MAX(id) FROM {DESIGN_POINTS}", default=0) or 0)
+                db.executemany(f"INSERT INTO {DESIGN_POINTS} (id, design_id, seq, x, y, z) VALUES (?, ?, ?, ?, ?, ?)",
+                               [(pid + k, did, k, *p) for k, p in enumerate(points, start=1)])
+
+    def rename_design(self, did: int, name: str) -> None:
+        name = _txt(name)
+        if not name:
+            raise ValueError(tr("Type a name for the designed pit"))
+        with self.target.connect() as db, db.transaction():
+            if db.scalar(f"SELECT COUNT(*) FROM {DESIGNS} WHERE name = ? AND id <> ?", (name, did)):
+                raise ValueError(tr("There is already a designed pit named {name}", name=name))
+            db.execute(f"UPDATE {DESIGNS} SET name = ? WHERE id = ?", (name, did))
+
+    def delete_design(self, did: int) -> None:
+        with self.target.connect() as db, db.transaction():
+            db.execute(f"DELETE FROM {DESIGN_POINTS} WHERE design_id = ?", (did,))
+            db.execute(f"DELETE FROM {DESIGNS} WHERE id = ?", (did,))
+
+    def next_design_name(self, base: str = "D") -> str:
+        """D1, D2, ... - the first not in use."""
+        used = {d.name for d in self.designs()}
+        n = 1
+        while f"{base}{n}" in used:
+            n += 1
+        return f"{base}{n}"
 
     # --- the network ---------------------------------------------------------------------------
     def network(self) -> Network:

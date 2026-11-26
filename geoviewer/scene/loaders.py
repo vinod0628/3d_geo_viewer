@@ -13,11 +13,11 @@ from ..i18n import N_, tr
 from ..io.surpac_dtm import _find_case_insensitive
 from .layers import BlockModelLayer, DrillholeLayer, Layer, StringLayer, SurfaceLayer, file_signature
 
-SUPPORTED_EXTENSIONS = {".str", ".dtm", ".csv", ".accdb", ".mdb", ".ddb", ".dxf"}
+SUPPORTED_EXTENSIONS = {".str", ".dtm", ".gvbm", ".csv", ".accdb", ".mdb", ".ddb", ".dxf"}
 
 FILE_FILTER = N_(      # shown as tr(FILE_FILTER) (or file_filter())
-    "Supported files (*.str *.dtm *.csv *.accdb *.mdb *.ddb *.dxf);;"
-    "Surpac strings (*.str);;Surpac DTM (*.dtm);;"
+    "Supported files (*.str *.dtm *.gvbm *.csv *.accdb *.mdb *.ddb *.dxf);;"
+    "Surpac strings (*.str);;Surpac DTM (*.dtm);;GeoViewer block model (*.gvbm);;"
     "Block model / drillhole CSV (*.csv);;Drillhole database (*.accdb *.mdb *.ddb);;DXF (*.dxf);;"
     "All files (*.*)"
 )
@@ -96,6 +96,10 @@ def load_paths(paths: list[str | Path]) -> tuple[list[Layer], list[str]]:
                 add(SurfaceLayer(name=p.stem, path=p, data=dtm, styles=styles), [p],
                     [p, dtm.string_file.path if dtm.string_file else None, styles.path if styles else None],
                     before)
+            elif ext == ".gvbm":
+                from ..blockmodel.store import read_block_model
+
+                add(BlockModelLayer(name=p.stem, path=p, data=read_block_model(p)), [p], [p], before)
             elif ext in (".accdb", ".mdb"):
                 add(DrillholeLayer(name=p.stem, path=p, data=read_drillholes_access(p)), [p], [p], before)
             elif ext == ".ddb":
@@ -201,7 +205,9 @@ def load_database_survey(fallback_folder) -> tuple[Layer | None, list[str]]:
         sig = survey_signature(target)
         store = SurveyStore(target)
         pits = store.pits()
-        data = SurveyData(pits, {s.name: s for s in store.stations()}, pit_paths(store.setups()), target.label)
+        data = SurveyData(pits, {s.name: s for s in store.stations()}, pit_paths(store.setups()), target.label,
+                          designs=store.designs())
+        _add_pit_geology(data, target)
     except Exception as e:  # noqa: BLE001 - unreachable server, no tables
         return None, [f"{SURVEY_LAYER_NAME}: {e}"]
     layer = SurveyLayer(name=SURVEY_LAYER_NAME, path=None, data=data)
@@ -210,6 +216,25 @@ def load_database_survey(fallback_folder) -> tuple[Layer | None, list[str]]:
     layer.db_target = target
     layer.db_file_sig = file_sig
     return layer, []
+
+
+def _add_pit_geology(data, target) -> None:
+    """The geology mapped in the pits, the rock colours and the samples' assay fields (none when
+    the tables are not there yet)."""
+    from ..io.drillhole_store import DrillholeStore
+    from ..io.pit_geology_store import PitGeologyStore
+
+    try:
+        store = PitGeologyStore(target)
+        data.geology = store.geology()
+        data.assay_fields = store.assay_fields()
+    except Exception as e:  # noqa: BLE001 - e.g. an older database without the tables
+        data.warnings.append(f"pit geology: {e}")
+    if data.geology:
+        try:
+            data.rock_colors = DrillholeStore(target).styles()
+        except Exception:  # noqa: BLE001 - no rock colours: palette colours
+            data.rock_colors = {}
 
 
 def load_database_layer(kind: str, fallback_folder) -> tuple[Layer | None, list[str]]:

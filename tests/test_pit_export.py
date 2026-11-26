@@ -314,3 +314,16 @@ def test_export_needs_the_export_feature(manager, monkeypatch):
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: pytest.fail("not licensed"))
     dlg.export_pits()
     dlg.export_map_png()
+
+
+def test_pit_volume_of_a_pit_and_with_its_branches():
+    """Properties show the volume of the drives as drawn: the decline ends on the level's wall, so the
+    junction is not counted twice; 'with branches' adds the whole family."""
+    from geoviewer.scene.survey import SurveyLayer
+
+    lay = SurveyLayer(name="Pits", path=None, data=_tee(), visible=False)
+    assert lay.pit_volume(2) == pytest.approx(4 * 4 * 100, rel=1e-6)
+    # the decline (5 m) stops on the wall of the 4 m high level; its lowest metre runs on under the level's floor
+    assert 5 * 5 * (100 - 2) < lay.pit_volume(1) < 5 * 5 * 100
+    assert lay.pit_volume(1, branches=True) == pytest.approx(lay.pit_volume(1) + 2 * 1600, rel=1e-6)
+    assert lay.pit_family(1) == {1, 2, 3} and lay.pit_volume(3, branches=True) == lay.pit_volume(3)
